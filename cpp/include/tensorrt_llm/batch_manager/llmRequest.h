@@ -128,7 +128,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-	SizeType32 numVocabs = 8)
+	    SizeType32 numVocabs = 8)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size() / numVocabs)
         , mMaxNewTokens(maxNewTokens)
@@ -181,7 +181,7 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
-	, mNumVocabs{numVocabs}
+	    , mNumVocabs{numVocabs}
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -249,7 +249,7 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
-	, mNumVocabs{numVocabs}
+	    , mNumVocabs{numVocabs}
     {
         if (mEncoderTokens.has_value())
         {
@@ -289,7 +289,7 @@ public:
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
-	, mNumVocabs(req.getNumVocabs())
+	    , mNumVocabs(req.getNumVocabs())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
@@ -1918,7 +1918,6 @@ protected:
 
     // Indicators whether each sibling completes generation.
     std::shared_ptr<std::vector<bool>> mSequenceFinalVec;
-    SizeType32 mNumVocabs;
 
     std::optional<TensorPtr> mSkipCrossAttnBlocks{std::nullopt};
 
@@ -1944,6 +1943,7 @@ protected:
 
     // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
     std::vector<size_t> mRequestedBlockHashes;
+    SizeType32 mNumVocabs;
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)

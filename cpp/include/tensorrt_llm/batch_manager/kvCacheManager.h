@@ -816,8 +816,6 @@ private:
     double mReusedTokens;
     // Total number of input tokens
     double mTotalInputTokens;
-    // Number of vocabs 
-    SizeType32 mNumVocabs;
     // Whether or not to maintain a hashmap of blocks.
     bool mEnableHashKey;
     // Whether blocks that are partially matched should be reused.
@@ -1105,6 +1103,8 @@ public:
         return mWindowBlockManagers.at(windowSize).getPool(relativePoolIndex);
     }
 
+    SizeType32 mNumVocabs;
+
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
@@ -1339,7 +1339,7 @@ public:
         bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
-        bool enablePartialReuse = true, bool copyOnpartialReuse = true, SizeType32 numVocabs = 8;
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true, SizeType32 numVocabs = 8);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,

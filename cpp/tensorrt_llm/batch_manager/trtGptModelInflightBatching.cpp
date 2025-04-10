@@ -1354,7 +1354,6 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         }
 
         mDecoders.clear();
-        auto const& vocabSizes = getVocabSizes();
         for (SizeType32 i = 0; i < getNumVocabs(); i++)
         {
             mDecoders.push_back(
@@ -1439,7 +1438,10 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
             mOperatingBeamWidth, getMaxSequenceLen(), mRuntime->getBufferManager()));
     }
 
-    mDecodingInputs.assign(getNumVocabs(), typename decltype(mDecodingInputs)::value_type(mNumMicroBatches));
+    mDecodingInputs.resize(getNumVocabs());
+    for (auto& inputs : mDecodingInputs) {
+        inputs.resize(mNumMicroBatches);
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -1956,7 +1958,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
-    DecoderFinishedEventPtr decoderFinishEvent;
+    runtime::CudaEvent decoderFinishEvent;
     for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
     {
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
@@ -2166,7 +2168,8 @@ std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::
             }
         }
     }
-    TLLM_CHECK_WITH_INFO(asyncHandles.size() <= 2 * getNumVocabs(), "Up to two decoder step async handles per vocab expected");
+    TLLM_CHECK_WITH_INFO(asyncHandles.size() <= static_cast<size_t>(2 * getNumVocabs()), "Up to two decoder step async handles per vocab expected");
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return asyncHandles;
 }

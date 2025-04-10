@@ -518,7 +518,7 @@ public:
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-        bool copyOnPartialReuse);
+        bool copyOnPartialReuse, SizeType32 numVocabs = 1);
 
     ~WindowBlockManager();
 
@@ -816,6 +816,8 @@ private:
     double mReusedTokens;
     // Total number of input tokens
     double mTotalInputTokens;
+    // Number of vocabs 
+    SizeType32 mNumVocabs;
     // Whether or not to maintain a hashmap of blocks.
     bool mEnableHashKey;
     // Whether blocks that are partially matched should be reused.
@@ -1317,7 +1319,7 @@ public:
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
-        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true, SizeType32 numVocabs = 8);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -1327,7 +1329,7 @@ public:
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true, SizeType32 numVocabs = 8);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -1337,7 +1339,7 @@ public:
         bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
-        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true, SizeType32 numVocabs = 8;
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -1345,7 +1347,7 @@ public:
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
         SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
-        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true, SizeType32 numVocabs = 1);
 
     ~KVCacheManager() override = default;
 

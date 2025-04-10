@@ -513,7 +513,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    bool copyOnPartialReuse, SizeType32 numVocabs)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -538,6 +538,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mEnableHashKey{enableHashKey}
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
+    , mNumVocabs{numVocabs}
 {
     std::map<SizeType32, SizeType32> numLayersPerPool;
 
@@ -633,11 +634,11 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
-        auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
-        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], windowSize);
-    }
+    auto const numVocabs = llmRequest.getNumVocabs();
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - numVocabs, getTokensPerBlock() * numVocabs, false);
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], windowSize);
 }
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
@@ -940,8 +941,9 @@ void WindowBlockManager::offloadBlock(BlockPtr const& block)
 std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
+    auto const numVocabs = llmRequest.getNumVocabs();
     auto blockedUniqueTokens
-        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size(), mTokensPerBlock, false);
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size(), mTokensPerBlock * numVocabs, false);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
     BlockKey ret;
     ret.loraTaskId = llmRequest.getLoraTaskId();
@@ -987,7 +989,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         {
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
-            numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size();
+            numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size() / mNumVocabs;
             if (perBlockRetentions[bi].retentionPriority.has_value()
                 && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
             {
@@ -1116,6 +1118,7 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
 void WindowBlockManager::addSequence(
     GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
 {
+    
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
     TLLM_CHECK(emplaceDone);
@@ -1126,7 +1129,8 @@ void WindowBlockManager::addSequence(
         : *(llmRequest.getEncoderUniqueTokens().value());
 
     // Ignore last token because it can't be recovered
-    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
+    auto const numVocabs = llmRequest.getNumVocabs();
+    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, (inputLength - 1) * numVocabs, mTokensPerBlock * numVocabs, true);
     // Add empty block if last token is separated
     if (inputLength % mTokensPerBlock == 1)
     {
@@ -1142,7 +1146,7 @@ void WindowBlockManager::addSequence(
 
     TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
 
-    auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions);
+    auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions) / numVocabs;
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen, getTokensPerBlock());
@@ -1263,7 +1267,7 @@ void WindowBlockManager::storeBlocks(
             TLLM_LOG_DEBUG("%s::storeBlocks - No match, inserting block %d into search structure", mLogPrefix.c_str(),
                 block->getBlockId());
             needMatch = false; // no matching needed for following blocks
-            block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+            block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock * mNumVocabs);
             block->setPrevBlock(searchRoot);
             block->setPrevBlockInSeq(searchRoot);
             searchRoot->addNextBlock(blockKey, block);
@@ -1431,8 +1435,9 @@ void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, Option
     // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
     // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
     // the last token's state is not filled yet.
-    auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
-    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
+    auto const numVocabs = llmRequest->getNumVocabs();
+    auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - numVocabs;
+    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock * numVocabs, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
     storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
 }
@@ -1487,12 +1492,12 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
     std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
     SizeType32 sinkTokenLength, int64_t stream, std::optional<runtime::SizeType32> maxSequenceLength,
-    bool enableBlockReuse, bool onboardBlocks, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse)
+    bool enableBlockReuse, bool onboardBlocks, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse, SizeType32 numVocabs)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksInPrimaryPool,
         blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype,
         sinkTokenLength, std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)),
         maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, false, enablePartialReuse,
-        copyOnPartialReuse)
+        copyOnPartialReuse, numVocabs)
 {
 }
 
@@ -1503,12 +1508,12 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 sinkTokenLength, int64_t stream, std::optional<runtime::SizeType32> maxSequenceLength,
     bool enableBlockReuse, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
+    std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse, SizeType32 numVocabs)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
         enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse,
-        copyOnPartialReuse)
+        copyOnPartialReuse, numVocabs)
 {
 }
 
@@ -1520,7 +1525,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     bool enableBlockReuse, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    bool copyOnPartialReuse, SizeType32 numVocabs)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
     , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
@@ -1530,10 +1535,11 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     , mBlockManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool,
           maxNumSequences, std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec,
           tempAttentionWindowInputs, dtype, mSinkBubbleLength, onboardBlocks, cacheType, secondaryOffloadMinPriority,
-          std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
+          std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse, numVocabs)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
     , mEnableHashKey{enableHashKey}
+    
 {
     TLLM_CHECK_DEBUG(std::find(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end(), mMaxAttentionWindow)
         != maxAttentionWindowVec.end());

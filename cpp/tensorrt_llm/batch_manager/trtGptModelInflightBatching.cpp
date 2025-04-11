@@ -2242,7 +2242,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                 numDroppedTokens[beam] = numGeneratedTokens - numNewTokens[beam];
                 for (SizeType32 step = 0; step < numNewTokens[beam]; ++step)
                 {
-
+                    SizeType32 vocabOffset = 0;
                     for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
                     {
 
@@ -2250,7 +2250,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                         auto const newTokenIdx = tc::flat_index(hostNewOutputTokensShape.d, step, seqSlot, beam);
                         auto const* const hostNewOutputTokensData = bufferCast<TokenIdType const>(*mDecoderBuffers[vid]->newOutputTokensHost);
                         auto const newToken = hostNewOutputTokensData[newTokenIdx];
-                        llmReq->addNewToken(newToken + getVocabSize() * vid, beam);
+                        llmReq->addNewToken(newToken + vocabOffset, beam);
                         TLLM_LOG_DEBUG("request ID %ld beam %d newToken %d", llmReq->mRequestId, beam, newToken);
 
                         if (llmReq->returnLogProbs())
@@ -2267,7 +2267,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                             std::vector<float> logProbs(logProbsPtr + offset, logProbsPtr + offset + generatedLength);
                             llmReq->setLogProbs(logProbs, beam);
                         }
-
+                        vocabOffset += mModelConfig.getVocabSizes()[vid];
                     }
 
 

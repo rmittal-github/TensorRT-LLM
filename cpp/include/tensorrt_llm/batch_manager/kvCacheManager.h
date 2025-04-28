@@ -822,6 +822,8 @@ private:
     bool mEnablePartialReuse;
     // Whether partially matched blocks that are already in use should be copied and reused.
     bool mCopyOnPartialReuse;
+    // Number of vocabs
+    SizeType32 mNumVocabs;
 };
 
 class BlockManager
@@ -839,7 +841,7 @@ public:
         SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
-        bool enablePartialReuse = true, bool copyOnPartialReuse = true);
+        bool enablePartialReuse = true, bool copyOnPartialReuse = true, SizeType32 numVocabs = 1);
 
     //! \brief Calculate the number of blocks each window size heap receives of blocksIn{Primary/Secondary}Pool
     //! \details Example:       (total=16384, uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
@@ -1102,8 +1104,6 @@ public:
         auto const relativePoolIndex = mAbsolutePoolToRelativePoolIndex.at(poolIdx);
         return mWindowBlockManagers.at(windowSize).getPool(relativePoolIndex);
     }
-
-    SizeType32 mNumVocabs;
 
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const

@@ -415,7 +415,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
-    bool copyOnPartialReuse)
+    bool copyOnPartialReuse, SizeType32 numVocabs)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
@@ -461,7 +461,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
             sizePerHead, tokensPerBlock, allottedPrimaryBlocks, allottedSecondaryBlocks, maxNumSequences, stream,
             onboardBlocks, cacheType, secondaryOffloadMinPriority, mEventManager, enableHashKey, enablePartialReuse,
-            copyOnPartialReuse);
+            copyOnPartialReuse, numVocabs);
     }
 
     auto const numAllPools = getNumPools();
@@ -634,11 +634,12 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
-    auto const numVocabs = llmRequest.getNumVocabs();
-    auto blockedUniqueTokens
-        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - numVocabs, getTokensPerBlock() * numVocabs, false);
-    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], windowSize);
+        auto const numVocabs = llmRequest.getNumVocabs();
+        auto blockedUniqueTokens
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - numVocabs, getTokensPerBlock() * numVocabs, false);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], windowSize);
+    }
 }
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
@@ -1418,26 +1419,11 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-<<<<<<< HEAD
         if (storeBlocksForReuse)
         {
             manager.storeBlocksForReuse(sequence, llmRequest);
         }
         manager.releaseBlocks(sequence);
-=======
-        auto constexpr beamIdx = 0;
-        auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
-        auto const& cacheBlockIds = sequence.getCacheBlockIds();
-
-        // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
-        // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
-        // the last token's state is not filled yet.
-	    auto const numVocabs = llmRequest->getNumVocabs();
-        auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - numVocabs;
-        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock * numVocabs, true);
-        auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
->>>>>>> f49f3074 (Fixes to compilation)
     }
 }
 

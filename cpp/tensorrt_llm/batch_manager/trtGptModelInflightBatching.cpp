@@ -1547,8 +1547,10 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto timeStart = std::chrono::steady_clock::now();
         auto const bufferId = getFusedBufferId();
         auto& runtimeBuffers = *mBuffers[bufferId];
+        // runtime buffers only use decoder buffers for cache indirection, speculative decoding.
+        // for now its safe to pass just decoderBuffers.front()
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
+            *mDecoderBuffers.front(), mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits());
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
         setupDecoderStep(
@@ -1992,7 +1994,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
         auto& decodingInput = mDecodingInputs[vid].at(mMicroBatchId);
         std::tie(decodingInput, mDecodingOutput[vid])
             = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests, scheduledRequests.generationRequests,
-                *mDecoderBuffers[vid], mDecoderInputBuffers.at(fusedBufferId), mDecoder->getDecoderState(),
+                *mDecoderBuffers[vid], mDecoderInputBuffers.at(fusedBufferId), mDecoders[vid]->getDecoderState(),
                 mModelConfig, getMaxNumSequences(), mOperatingBeamWidth, mRuntime->getBufferManager(),
                 mRuntime->getStream(), *fusedRuntimeBuffers);
 
@@ -2245,17 +2247,17 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                     SizeType32 vocabOffset = 0;
                     for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
                     {
-
-                        auto const hostNewOutputTokensShape = mDecoderBuffers[vid]->newOutputTokensHost->getShape();
+                        auto const& thisDecoderOutputBuffers = mDecoderOutputBuffers.at(getFusedBufferId()).at(vid);
+                        auto const hostNewOutputTokensShape = thisDecoderOutputBuffers.newOutputTokensHost->getShape();
                         auto const newTokenIdx = tc::flat_index(hostNewOutputTokensShape.d, step, seqSlot, beam);
-                        auto const* const hostNewOutputTokensData = bufferCast<TokenIdType const>(*mDecoderBuffers[vid]->newOutputTokensHost);
+                        auto const* const hostNewOutputTokensData = bufferCast<TokenIdType const>(*thisDecoderOutputBuffers.newOutputTokensHost);
                         auto const newToken = hostNewOutputTokensData[newTokenIdx];
                         llmReq->addNewToken(newToken + vocabOffset, beam);
                         TLLM_LOG_DEBUG("request ID %ld beam %d newToken %d", llmReq->mRequestId, beam, newToken);
 
                         if (llmReq->returnLogProbs())
                         {
-                            auto const* const cumLogProbsPtr = bufferCast<float const>(*mDecoderBuffers[vid]->cumLogProbsHost);
+                            auto const* const cumLogProbsPtr = bufferCast<float const>(*thisDecoderOutputBuffers.cumLogProbsHost);
                             auto const cumLogProb = cumLogProbsPtr[seqSlot * mOperatingBeamWidth + beam];
                             llmReq->setCumLogProb(cumLogProb, beam);
 
@@ -2263,7 +2265,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                             SizeType32 offset
                                 = (seqSlot * mOperatingBeamWidth + beam) * getMaxSequenceLen() + beginLogProbsOffset;
                             auto const generatedLength = seqLen - llmReq->mPromptLen;
-                            auto const* const logProbsPtr = bufferCast<float const>(*mDecoderBuffers[vid]->logProbsHost);
+                            auto const* const logProbsPtr = bufferCast<float const>(*thisDecoderOutputBuffers.logProbsHost);
                             std::vector<float> logProbs(logProbsPtr + offset, logProbsPtr + offset + generatedLength);
                             llmReq->setLogProbs(logProbs, beam);
                         }

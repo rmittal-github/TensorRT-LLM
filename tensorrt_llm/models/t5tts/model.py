@@ -25,8 +25,8 @@ from tensorrt_llm.functional import (ACT2FN, LayerNormPositionType,
                                      LayerNormType, MLPType,
                                      PositionEmbeddingType, Tensor, assertion,
                                      concat, gather_last_token_logits, maximum,
-                                     minimum, recv, select, send, shape, view, mean,
-                                     squeeze, unsqueeze)
+                                     mean, minimum, recv, send, shape, squeeze,
+                                     unsqueeze, view)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  AttentionMaskType, AttentionParams,
                                  BertAttention, ColumnLinear, Conv1d, Embedding,
@@ -62,7 +62,7 @@ class PositionwiseConvFF(Module):
         has_bias: bool = False,
         is_causal: bool = True,
         hidden_act: str = 'gelu',
-        padding: int = 0,
+        padding: Optional[int] = None,
         dilation: int = 1,
         dtype=None,
         groups: int = 1,
@@ -79,6 +79,13 @@ class PositionwiseConvFF(Module):
             self.causal_padding = ((kernel_size - 1) * dilation, 0)
 
             padding = 0
+
+        elif padding is None:
+            if kernel_size % 2 == 0:
+                raise ValueError(
+                    "`kernel_size` must be odd when `padding` is None.")
+
+            padding = int(dilation * (kernel_size - 1) / 2)
 
         self.proj = Conv1d(hidden_size,
                            ffn_hidden_size,
@@ -246,10 +253,10 @@ class EncoderDecoderEmbedding(Module):
 
         x = self.vocab_embedding(input_ids, *args) * self.embedding_scale
         if self.num_vocabs > 1:
-            x = view(
-                x,
-                concat([shape(x, 0) / self.num_vocabs, self.num_vocabs, -1])
-            )  # shape [totalSeqLen, nVocab, embDim]
+            x = view(x,
+                     concat(
+                         [shape(x, 0) / self.num_vocabs, self.num_vocabs,
+                          -1]))  # shape [totalSeqLen, nVocab, embDim]
             # average across vocabs
             x = mean(x, 1)  # shape [totalSeqLen, embDim]
 
@@ -317,7 +324,8 @@ class T5TTSEncoderLayer(Module):
 
         self.attention_layernorm = ln_type(normalized_shape=hidden_size,
                                            eps=layernorm_eps,
-                                           dtype=dtype)
+                                           dtype=dtype,
+                                           bias=False)
 
         self.pos_ff = PositionwiseConvFF(
             hidden_size=hidden_size,
@@ -333,7 +341,8 @@ class T5TTSEncoderLayer(Module):
 
         self.pos_ff_layernorm = ln_type(normalized_shape=hidden_size,
                                         eps=layernorm_eps,
-                                        dtype=dtype)
+                                        dtype=dtype,
+                                        bias=False)
 
         self.residual_scaling = residual_scaling
 
@@ -457,7 +466,8 @@ class T5TTSDecoderLayer(Module):
 
         self.self_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                 eps=layernorm_eps,
-                                                dtype=dtype)
+                                                dtype=dtype,
+                                                bias=False)
 
         # Note: self attn uses MMHA, mask is always causal triangular
         # cross attn has two scenarios:
@@ -481,7 +491,8 @@ class T5TTSDecoderLayer(Module):
             tp_rank=mapping.tp_rank,
             dtype=dtype,
             cross_attention=True,
-            relative_attention=False,  # Cross attention has no relative attention bias
+            relative_attention=
+            False,  # Cross attention has no relative attention bias
             max_distance=max_distance,
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.learned_absolute,
@@ -490,11 +501,15 @@ class T5TTSDecoderLayer(Module):
         self.cache_cross_attention_memory = None
         if has_encoder_input_layernorm:
             self.cross_attention_memory_layernorm = ln_type(
-                normalized_shape=hidden_size, eps=layernorm_eps, dtype=dtype)
+                normalized_shape=hidden_size,
+                eps=layernorm_eps,
+                dtype=dtype,
+                bias=False)
 
         self.cross_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                  eps=layernorm_eps,
-                                                 dtype=dtype)
+                                                 dtype=dtype,
+                                                 bias=False)
 
         self.pos_ff = PositionwiseConvFF(
             hidden_size=hidden_size,
@@ -510,7 +525,8 @@ class T5TTSDecoderLayer(Module):
 
         self.pos_ff_layernorm = ln_type(normalized_shape=hidden_size,
                                         eps=layernorm_eps,
-                                        dtype=dtype)
+                                        dtype=dtype,
+                                        bias=False)
 
         self.residual_scaling = residual_scaling
 
@@ -704,7 +720,8 @@ class T5TTSEncoderModel(PretrainedModel):
                 self.final_layernorm = ln_type(
                     normalized_shape=self.config.hidden_size,
                     eps=self.config.norm_epsilon,
-                    dtype=self.config.dtype)
+                    dtype=self.config.dtype,
+                    bias=self.config.has_final_layernorm_bias)
 
     def check_config(self, config: PretrainedConfig):
         config.set_if_not_exist('has_position_embedding', False)
@@ -725,6 +742,7 @@ class T5TTSEncoderModel(PretrainedModel):
         config.set_if_not_exist('has_embedding_scale', False)
         config.set_if_not_exist('residual_scaling', 1.0)
         config.set_if_not_exist('has_lm_head_bias', False)
+        config.set_if_not_exist('has_final_layernorm_bias', False)
         config.set_if_not_exist('num_buckets', None)
         config.set_if_not_exist('max_distance', None)
         config.set_if_not_exist('relative_attention', False)
@@ -769,6 +787,7 @@ class T5TTSEncoderModel(PretrainedModel):
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
             hidden_states.mark_output('hidden_states_output', self._dtype)
+            self.register_network_output('hidden_states_output', hidden_states)
 
         return hidden_states
 
@@ -1079,7 +1098,8 @@ class T5TTSDecoderModel(PretrainedModel):
                 self.final_layernorm = ln_type(
                     normalized_shape=self.config.hidden_size,
                     eps=self.config.norm_epsilon,
-                    dtype=self.config.dtype)
+                    dtype=self.config.dtype,
+                    bias=self.config.has_final_layernorm_bias)
 
             self.lm_head = ColumnLinear(
                 self.config.hidden_size,
@@ -1110,7 +1130,7 @@ class T5TTSDecoderModel(PretrainedModel):
         config.set_if_not_exist('has_encoder_input_layernorm', True)
         config.set_if_not_exist('has_model_final_layernorm', False)
         config.set_if_not_exist('audio_embedding_dim', 768)
-
+        config.set_if_not_exist('has_final_layernorm_bias', False)
         config.set_if_not_exist('encoder_hidden_size', None)
         config.set_if_not_exist('encoder_num_heads', None)
         config.set_if_not_exist('encoder_num_kv_heads', None)
@@ -1145,7 +1165,8 @@ class T5TTSDecoderModel(PretrainedModel):
 
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
-            hidden_states = self.embedding(decoder_input_ids, position_ids, None)
+            hidden_states = self.embedding(decoder_input_ids, position_ids,
+                                           None)
             self.register_network_output('embedding_layer_output',
                                          hidden_states)
         else:
@@ -1295,7 +1316,9 @@ class T5TTSDecoderModel(PretrainedModel):
             max(max_decoder_input_len * max_batch_size,
                 max_beam_width * max_batch_size),
         ]
-        multivocab_decoder_num_tokens_range = [x * self.num_vocabs for x in decoder_num_tokens_range]
+        multivocab_decoder_num_tokens_range = [
+            x * self.num_vocabs for x in decoder_num_tokens_range
+        ]
 
         # No enable_two_optimization_profiles support yet
 
@@ -1374,7 +1397,8 @@ class T5TTSDecoderModel(PretrainedModel):
                                    shape=[-1, -1],
                                    dim_range=OrderedDict([
                                        ('batch_size_beam_width', [bb_range]),
-                                       ('multivocab_input_len', [multivocab_inlen_range]),
+                                       ('multivocab_input_len',
+                                        [multivocab_inlen_range]),
                                    ]))
                 if self.has_position_embedding:
                     position_ids = Tensor(name='position_ids',
@@ -1754,9 +1778,12 @@ class T5TTSDecoderModel(PretrainedModel):
                 host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
                 cross_kv_cache_block_offsets=cross_kv_cache_block_offsets,
-                host_cross_kv_cache_block_offsets=host_cross_kv_cache_block_offsets,
-                host_cross_kv_cache_pool_pointers=host_cross_kv_cache_pool_pointers,
-                host_cross_kv_cache_pool_mapping=host_cross_kv_cache_pool_mapping,
+                host_cross_kv_cache_block_offsets=
+                host_cross_kv_cache_block_offsets,
+                host_cross_kv_cache_pool_pointers=
+                host_cross_kv_cache_pool_pointers,
+                host_cross_kv_cache_pool_mapping=
+                host_cross_kv_cache_pool_mapping,
             )
 
             attention_params = AttentionParams(

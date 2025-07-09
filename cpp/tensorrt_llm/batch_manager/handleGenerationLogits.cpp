@@ -25,6 +25,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
+#include "tensorrt_llm/kernels/cfgKernels.h"
 
 namespace tru = tensorrt_llm::runtime::utils;
 
@@ -75,7 +76,8 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 
 void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector const& generationRequests,
     DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, BufferManager const& manager,
-    TensorPtr const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers, SizeType32 vocabId) const
+    tensorrt_llm::runtime::CudaStream const& stream, TensorPtr const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers,
+    SizeType32 vocabId) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleGenerationLogits);
@@ -91,7 +93,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
     for (auto const& llmReq : generationRequests)
     {
         auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
-        auto const seqSlot = llmReq->mSeqSlot.value();
+        auto const seqSlot = llmReq->mSeqSlots.at(0);
 
         auto const draftLength = llmReq->getNumDraftTokens();
         auto const numLogits = draftLength + reqBeamWidth;
@@ -107,6 +109,15 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex, numLogits);
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
+
+        // CFG implementation: get unconditional logits and add them to logitsView
+        if (llmReq->isCfg()) {
+            logitsIndex += numLogits;
+            TensorPtr uncondLogitsView = ITensor::slice(logits, logitsIndex, numLogits);
+            // TODO: implement CFG, apply logitsView = logitsView * cfgScale + uncondLogitsView * (1 - cfgScale)
+            float cfgScale = llmReq->mSamplingConfig.cfgScale->at(0);
+            tensorrt_llm::kernels::invokeCfg(stream, logitsView, uncondLogitsView, cfgScale, vocabOffset, vocabSizes[vocabId]);
+        }
 
         auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
         auto const logitsViewShape = logitsView->getShape();

@@ -52,7 +52,7 @@ mlp_map = {
 }
 
 COMPUTE_SCORES_FROM_LAYERS = [4,6,10]
-APPLY_PRIOR_TO_LAYERS = [4,5,6,7,8,9,10,11]
+APPLY_PRIOR_TO_LAYERS = [4,6,10]
 
 
 class PositionwiseConvFF(Module):

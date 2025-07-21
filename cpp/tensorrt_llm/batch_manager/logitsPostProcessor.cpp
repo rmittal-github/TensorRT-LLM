@@ -35,7 +35,7 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
     bool replicateLogitsPostProcessor, DecoderBuffers& decoderBuffers, tr::WorldConfig const& worldConfig,
-    tr::TllmRuntime& runtime, std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched) const
+    runtime::BufferManager::CudaStreamPtr const& streamPtr, std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(LogitsPostProcessor);
@@ -61,7 +61,7 @@ bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, Reque
                     {
                         auto& logits = decoderBuffers.logits.at(llmReq->mSeqSlots.at(0));
                         (*llmReq->mLogitsPostProcessor)(
-                            llmReq->mRequestId, logits, llmReq->getTokens(), runtime.getStreamPtr(), llmReq->mClientId);
+                            llmReq->mRequestId, logits, llmReq->getTokens(), streamPtr, llmReq->mClientId);
                     }
                 }
                 else if (llmReq->mApplyLogitsPostProcessorBatched)
@@ -84,7 +84,7 @@ bool LogitsPostProcessor::operator()(RequestVector const& contextRequests, Reque
         logitsPostProcessorIsApplied = true;
         if (replicateLogitsPostProcessor || worldConfig.isFirstTensorParallelRank())
         {
-            (*logitsPostProcessorBatched)(reqIdsVec, logitsVec, beamTokensVec, runtime.getStreamPtr(), clientIdsVec);
+            (*logitsPostProcessorBatched)(reqIdsVec, logitsVec, beamTokensVec, streamPtr, clientIdsVec);
         }
     }
 

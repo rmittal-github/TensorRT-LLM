@@ -159,14 +159,14 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
         .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
             py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("decoder_input_buffers"),
             py::arg("decoder_state"), py::arg("model_config"), py::arg("max_num_sequences"), py::arg("beam_width"),
-            py::arg("buffer_manager"), py::arg("stream"), py::arg("fused_runtime_buffers") = std::nullopt)
+            py::arg("stream"), py::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 
     py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
         .def(py::init())
         .def("__call__", &LogitsPostProcessor::operator(), py::arg("context_requests"), py::arg("generation_requests"),
             py::arg("replicate_logits_post_processor"), py::arg("decoder_buffers"), py::arg("world_config"),
-            py::arg("runtime"), py::arg("logits_post_processor_batched") = std::nullopt)
+            py::arg("stream_ptr"), py::arg("logits_post_processor_batched") = std::nullopt)
         .def("name", [](LogitsPostProcessor const&) { return LogitsPostProcessor::name; });
 
     py::class_<CreateNewDecoderRequests>(m, CreateNewDecoderRequests::name)

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
@@ -285,8 +286,7 @@ private:
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    runtime::CudaEvent updateDecoderBuffers(
-        bool returnLogProbs, runtime::CudaEvent decoderFinishEvent, SizeType32 vocabId = 0);
+    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::BufferManager const& decoderBufferManager, SizeType32 vocabId = 0);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -303,8 +303,21 @@ private:
     /// @brief Copies the content of the cache indirection outputs to the cache indirection inputs.
     /// @param[in] scheduledRequests The requests to copy the cache indirections for.
     /// @param[in] genBufferId The id of the generation buffers for those requests.
+    /// @param[out] batchIdxOut The index of the batch to copy the cache indirection for.
+    /// @param[out] copySizeOut The size of the cache indirection to copy.
     void copyCacheIndirectionFromOutputsToInputs(
-        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId);
+        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 *batchIdxOut, runtime::SizeType64 *copySizeOut);
+
+    /// @brief Copies the content of the cache indirection outputs to the cache indirection inputs.
+    /// @param[in] scheduledRequests The requests to copy the cache indirections for.
+    /// @param[in] genBufferId The id of the generation buffers for those requests.
+    /// @param[in] vocabId The id of the vocabulary to copy the cache indirections for.
+    /// @param[in] batchIdx The index of the batch to copy the cache indirection for.
+    /// @param[in] copySize The size of the cache indirection to copy.
+    /// @param[in] stream The stream to copy the cache indirection on.
+    void copyCacheIndirectionFromOutputsToInputsPerVocab(
+        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId,
+        SizeType32 batchIdx, runtime::SizeType64 copySize, runtime::CudaStream const& stream);
 
     [[nodiscard]] bool getGatherGenerationLogits() const override
     {

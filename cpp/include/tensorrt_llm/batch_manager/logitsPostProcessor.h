@@ -49,7 +49,7 @@ public:
 
     bool operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
         bool replicateLogitsPostProcessor, DecoderBuffers& decoderBuffers, tr::WorldConfig const& worldConfig,
-        tr::TllmRuntime& runtime,
+        runtime::BufferManager::CudaStreamPtr const& streamPtr,
         std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt) const;
 };
 

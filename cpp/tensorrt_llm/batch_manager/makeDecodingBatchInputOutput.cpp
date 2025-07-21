@@ -112,50 +112,13 @@ std::vector<SizeType32> getActiveSlots(RequestVector const& contextRequests, Req
 
     return activeSlots;
 }
-
-void copySequenceLengths(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderInputBuffers const& inputBuffers, TensorPtr const& sequenceLengths, SizeType32 beamWidth,
-    runtime::BufferManager const& manager, runtime::CudaStream const& stream)
-{
-    auto const batchSize = contextRequests.size() + generationRequests.size();
-    auto batchSlotsView = tr::ITensor::slice(inputBuffers.forwardBatchSlotsRequestOrder, 0, batchSize);
-    auto fillValuesView = tr::ITensor::slice(inputBuffers.fillValues, 0, batchSize);
-
-    auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlotsView);
-    auto fillValuesRange = tr::BufferRange<SizeType32>(*fillValuesView);
-
-    // fill buffers on host
-    SizeType32 batchIdx{0};
-    for (auto const& requests : {contextRequests, generationRequests})
-    {
-        for (auto const& llmReq : requests)
-        {
-            auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
-            // Get position of the current sequence in the decoder
-            auto const seqSlot = llmReq->mSeqSlots.at(0);
-            batchSlotsRange[batchIdx] = seqSlot;
-            fillValuesRange[batchIdx] = currentSequenceLen;
-            ++batchIdx;
-        }
-    }
-
-    // copy sequence lengths
-    {
-        auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.forwardBatchSlotsRequestOrderDevice, 0, batchSize);
-        auto fillValuesViewDevice = tr::ITensor::slice(inputBuffers.fillValuesDevice, 0, batchSize);
-
-        manager.copy(*batchSlotsView, *batchSlotsDeviceView);
-        manager.copy(*fillValuesView, *fillValuesViewDevice);
-        tr::kernels::invokeFillBatch(*sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
-    }
-}
 } // namespace
 
 std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>>
 MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
     DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
     runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
-    SizeType32 beamWidth, runtime::BufferManager const& manager, runtime::CudaStream const& stream,
+    SizeType32 beamWidth, runtime::CudaStream const& stream,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -187,8 +150,13 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
         decodingInput->eagleLastInputs = fusedRuntimeBuffers->eagleBuffers->engineInputs;
     }
 
-    copySequenceLengths(contextRequests, generationRequests, inputBuffers,
-        decoderState.getJointDecodingOutput().lengths, beamWidth, manager, stream);
+    auto const batchSize = contextRequests.size() + generationRequests.size();
+    auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.forwardBatchSlotsRequestOrderDevice, 0, batchSize);
+    auto fillValuesViewDevice = tr::ITensor::slice(inputBuffers.fillValuesDevice, 0, batchSize);
+    tr::kernels::invokeFillBatch(
+        *decoderState.getJointDecodingOutput().lengths,
+        *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream
+    );
 
     auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
     decodingOutput->cacheIndirection = decoderBuffers.cacheIndirectionOutput;

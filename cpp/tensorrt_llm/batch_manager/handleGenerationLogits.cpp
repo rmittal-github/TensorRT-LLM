@@ -25,7 +25,6 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
-#include "tensorrt_llm/kernels/cfgKernels.h"
 
 namespace tru = tensorrt_llm::runtime::utils;
 
@@ -107,16 +106,10 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         // genRuntimeBuffers.logits shape: [numGen*reqBeamWidth, vocabSize]
         // logitsView shape: [numLogits, vocabSize]
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex, numLogits);
-        TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
-            "Found invalid number (NaN or Inf) in logits");
 
         // CFG implementation: get unconditional logits and add them to logitsView
         if (llmReq->isCfg()) {
             logitsIndex += numLogits;
-            TensorPtr uncondLogitsView = ITensor::slice(logits, logitsIndex, numLogits);
-            // TODO: implement CFG, apply logitsView = logitsView * cfgScale + uncondLogitsView * (1 - cfgScale)
-            float cfgScale = llmReq->mSamplingConfig.cfgScale->at(0);
-            tensorrt_llm::kernels::invokeCfg(stream, logitsView, uncondLogitsView, cfgScale, vocabOffset, vocabSizes[vocabId]);
         }
 
         auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
@@ -142,6 +135,11 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
 
         if (llmReq->getReturnGenerationLogits())
         {
+            if (vocabId > 0)
+            {
+                TLLM_THROW("Returning generation logits is not supported for multi vocab sampling");
+            }
+
             TLLM_CHECK_WITH_INFO(modelConfig.getSpeculativeDecodingMode().isNone()
                     || modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal(),
                 "Only speculative decoding with external draft tokens supports returning generation logits");
@@ -164,6 +162,10 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         }
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
+            if (vocabId > 0)
+            {
+                TLLM_THROW("Speculative decoding is not supported for multi vocab sampling");
+            }
             TLLM_CHECK(genRuntimeBuffers);
             // speculative decoding is not supported for numVocabs > 1
             auto& medusaLogitsHeads = decoderBuffers.draftBuffers.predictedDraftLogits.at(seqSlot);

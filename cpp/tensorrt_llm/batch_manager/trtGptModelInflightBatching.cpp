@@ -52,6 +52,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/timestampUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/cfgKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -779,8 +780,8 @@ void TrtGptModelInflightBatching::forwardSync()
                     {
                         llmReq->setNumPreDecodedTokens(0, beam);
                     }
-                    //bool crossAttnFinished = mModelConfig.useAttentionPrior() && llmReq->isAttentionPriorFinished();
-                    if (llmReq->isGenerationToCompleteState()) // || crossAttnFinished)
+                    bool crossAttnFinished = mModelConfig.useAttentionPrior() && llmReq->isAttentionPriorFinished();
+                    if (llmReq->isGenerationToCompleteState() || crossAttnFinished)
                     {
                         llmReq->setState(LlmRequestState::kGENERATION_COMPLETE);
                         terminateRequest(llmReq);
@@ -1948,29 +1949,84 @@ static inline void setupInputBuffers(
     }
 }
 
+static inline SizeType32 applyCfgToContextLogits(
+    RequestVector const& contextRequests,
+    std::vector<SizeType32> const& numContextLogitsVec, runtime::ITensor::SharedPtr const& logits,
+    tr::ModelConfig const& modelConfig, tensorrt_llm::runtime::CudaStream const& stream
+) {
+    SizeType32 logitsIndex{0};
+    SizeType32 batchIndex{0};
+    for (auto const& llmReq : contextRequests)
+    {
+        auto const numContextLogits = numContextLogitsVec.at(batchIndex);
+        auto const draftLength = llmReq->isLastContextChunk() ? llmReq->getNumDraftTokens() : 0;
+
+        logitsIndex += numContextLogits + draftLength;
+
+        // this is CFG support implementation, where we advance the logits index through the unconditional logits
+        if (llmReq->isCfg()) {
+            // Get the logits from the last context token and draft tokens
+            auto const numDecoderLogits = 1 + draftLength;
+            runtime::ITensor::SharedPtr logitsView = ITensor::slice(logits, logitsIndex - numDecoderLogits, numDecoderLogits);
+
+            logitsIndex += numContextLogits + draftLength;
+            runtime::ITensor::SharedPtr uncondLogitsView = ITensor::slice(logits, logitsIndex - numDecoderLogits, numDecoderLogits);
+            // TODO: implement CFG, apply logitsView = logitsView * cfgScale + uncondLogitsView * (1 - cfgScale)
+
+            float cfgScale = llmReq->mSamplingConfig.cfgScale->at(0);
+            tensorrt_llm::kernels::invokeCfg(stream, logitsView, uncondLogitsView, cfgScale, 0, modelConfig.getVocabSize());
+        }
+        ++batchIndex;
+        if (llmReq->isCfg()) {
+            ++batchIndex;
+        }
+    }
+    return logitsIndex;
+}
+
+static inline void applyCfgToGenLogits(SizeType32 logitsIndex, RequestVector const& generationRequests,
+    tr::ModelConfig const& modelConfig, tensorrt_llm::runtime::CudaStream const& stream, runtime::ITensor::SharedPtr const& logits)
+{
+    for (auto const& llmReq : generationRequests)
+    {
+        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+        auto const draftLength = llmReq->getNumDraftTokens();
+        auto const numLogits = draftLength + reqBeamWidth;
+        TLLM_CHECK(draftLength == 0 || reqBeamWidth == 1);
+        if (llmReq->isCfg())
+        {
+            // genRuntimeBuffers.logits shape: [numGen*reqBeamWidth, vocabSize]
+            // logitsView shape: [numLogits, vocabSize]
+            runtime::ITensor::SharedPtr logitsView = ITensor::slice(logits, logitsIndex, numLogits);
+            // CFG implementation: logitsView = logitsView * cfgScale + uncondLogitsView * (1 - cfgScale)
+            // is applied to logits of all vocabs via single invocation
+            logitsIndex += numLogits;
+            runtime::ITensor::SharedPtr uncondLogitsView = ITensor::slice(logits, logitsIndex, numLogits);
+            float cfgScale = llmReq->mSamplingConfig.cfgScale->at(0);
+            tensorrt_llm::kernels::invokeCfg(stream, logitsView, uncondLogitsView, cfgScale, 0, modelConfig.getVocabSize());
+        }
+        logitsIndex += numLogits;
+    }
+}
+
 runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledRequests const& scheduledRequests)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
-    std::vector<runtime::CudaEvent> decoderFinishEvents(getNumVocabs());
-    for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
-    {
-        auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
-        auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
-        auto const logitsIndex = (*mHandleContextLogits)(scheduledRequests.contextRequests,
-            contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, *mDecoderBuffers[vid], mModelConfig,
-            mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->medusaBuffers, vid);
+    auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
+    auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
 
-        auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
-        auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
-        auto& genRuntimeBuffers = mBuffers.at(genBufferId);
-        (*mHandleGenerationLogits)(genLogitsIndex, scheduledRequests.generationRequests, *mDecoderBuffers[vid],
-            mModelConfig, mRuntime->getBufferManager(), mRuntime->getStream(), genRuntimeBuffers->logits, *genRuntimeBuffers, vid);
-    }
+    auto const logitsIndex = applyCfgToContextLogits(scheduledRequests.contextRequests,
+        contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, mModelConfig, mRuntime->getStream());
 
-
+    auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
+    auto& genRuntimeBuffers = mBuffers.at(genBufferId);
+
+    applyCfgToGenLogits(genLogitsIndex, scheduledRequests.generationRequests, mModelConfig,
+        mRuntime->getStream(), genRuntimeBuffers->logits);
+
     SizeType32 indirectionBatchIdx{0};
     SizeType64 indirectionCopySize{0};
     copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId, &indirectionBatchIdx, &indirectionCopySize);
@@ -1981,11 +2037,21 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
         scheduledRequests.contextRequests, scheduledRequests.generationRequests,
         mDecoderInputBuffers.at(fusedBufferId), mRuntime->getBufferManager()
     );
+
+    std::vector<runtime::CudaEvent> decoderFinishEvents(getNumVocabs());
     auto decodingStart = runtime::CudaEvent{};
     mRuntime->getStreamPtr()->record(decodingStart);
     for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
     {
         mDecoders[vid]->getDecoderStream()->wait(decodingStart);
+
+        (*mHandleContextLogits)(scheduledRequests.contextRequests,
+            contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, *mDecoderBuffers[vid], mModelConfig,
+            mDecoders[vid]->getBufferManager(), *mDecoders[vid]->getDecoderStream(), contextRuntimeBuffers->medusaBuffers, vid);
+
+        (*mHandleGenerationLogits)(genLogitsIndex, scheduledRequests.generationRequests, *mDecoderBuffers[vid],
+            mModelConfig, mDecoders[vid]->getBufferManager(), *mDecoders[vid]->getDecoderStream(),
+            genRuntimeBuffers->logits, *genRuntimeBuffers, vid);
 
         copyCacheIndirectionFromOutputsToInputsPerVocab(
             scheduledRequests, genBufferId, vid,
@@ -2377,8 +2443,8 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
 
             // Terminate if request has finished or if it is speculative decoding target model
             if (decoderFinishedSumPtr[seqSlot] == reqBeamWidth
-                || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens()))
-                //|| (mModelConfig.useAttentionPrior() && llmReq->isAttentionPriorFinished()))
+                || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens())
+                || (mModelConfig.useAttentionPrior() && llmReq->isAttentionPriorFinished()))
             {
                 postProcessRequest(*llmReq, numDroppedTokens);
 

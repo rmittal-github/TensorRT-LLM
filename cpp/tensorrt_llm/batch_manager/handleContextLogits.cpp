@@ -25,7 +25,6 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
-#include "tensorrt_llm/kernels/cfgKernels.h"
 
 namespace tru = tensorrt_llm::runtime::utils;
 
@@ -91,6 +90,9 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
 
         if (modelConfig.computeContextLogits())
         {
+            if (vocabId > 0) {
+                TLLM_THROW("Returning context logits is not supported for multi vocab sampling");
+            }
             // Since the computational graph has been modified, only the last token is needed.
             TLLM_CHECK_WITH_INFO(!modelConfig.getSpeculativeDecodingMode().isMedusa()
                     && !modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding(),
@@ -120,22 +122,14 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         // this is CFG support implementation, where we advance the logits index through the unconditional logits
         if (llmReq->isCfg()) {
             logitsIndex += numContextLogits + draftLength;
-            TensorPtr uncondLogitsView = ITensor::slice(logits, logitsIndex - numDecoderLogits, numDecoderLogits);
-            // TODO: implement CFG, apply logitsView = logitsView * cfgScale + uncondLogitsView * (1 - cfgScale)
-
-            float cfgScale = llmReq->mSamplingConfig.cfgScale->at(0);
-            SizeType32 vocabOffset = 0;
-            auto vocabSizes = modelConfig.getVocabSizes();
-            for (SizeType32 i = 0; i < vocabId; ++i)
-            {
-                vocabOffset += vocabSizes[i];
-            }
-            tensorrt_llm::kernels::invokeCfg(stream, logitsView, uncondLogitsView, cfgScale, vocabOffset, vocabSizes[vocabId]);
         }
 
         auto const seqSlot = llmReq->mSeqSlots.at(0);
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
+            if (vocabId > 0) {
+                TLLM_THROW("Speculative decoding is not supported for multi vocab sampling");
+            }
             TLLM_CHECK(medusaBuffers);
             // speculative decoding is not supported for numVocabs > 1
             auto& medusaLogitsHeads = decoderBuffers.draftBuffers.predictedDraftLogits.at(seqSlot);
@@ -148,6 +142,9 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         // save the accepted token logits from target model
         if (llmReq->getReturnGenerationLogits())
         {
+            if (vocabId > 0) {
+                TLLM_THROW("Returning generation logits is not supported for multi vocab sampling");
+            }
             copyLastContextLogits(logitsView, *llmReq, manager);
         }
 
@@ -158,6 +155,9 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
 
         if (reqBeamWidth > 1)
         {
+            if (vocabId > 0) {
+                TLLM_THROW("Beam width > 1 is not supported for multi vocab sampling");
+            }
             // Tile logits of context requests
             auto const logitsShape = logitsView->getShape();
             auto const logitsType = logitsView->getDataType();

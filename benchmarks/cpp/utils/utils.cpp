@@ -115,7 +115,9 @@ Samples parseWorkloadJson(
                     "input_feat size %zu is not divisible by input_len %d", inputFeatVec.size(), inputLen);
 
                 hiddenDim = static_cast<int32_t>(inputFeatVec.size() / inputLen);
-                inputFeat = texec::Tensor::of(inputFeatVec.data(), {inputLen, hiddenDim});
+
+                inputFeat = texec::Tensor::cpu(texec::DataType::kFP32, {inputLen, hiddenDim});
+                std::memcpy(inputFeat.getData(), inputFeatVec.data(), inputFeatVec.size() * sizeof(float));
             }
         }
         texec::Tensor contextFeat;
@@ -132,7 +134,9 @@ Samples parseWorkloadJson(
                     "context_feat size %zu is not divisible by hidden dim %d", contextFeatVec.size(), hiddenDim);
 
                 int32_t contextLen = static_cast<int32_t>(contextFeatVec.size() / hiddenDim);
-                contextFeat = texec::Tensor::of(contextFeatVec.data(), {contextLen, hiddenDim});
+
+                contextFeat = texec::Tensor::cpu(texec::DataType::kFP32, {contextLen, hiddenDim});
+                std::memcpy(contextFeat.getData(), contextFeatVec.data(), contextFeatVec.size() * sizeof(float));
             }
         }
 

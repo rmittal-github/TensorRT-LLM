@@ -1554,8 +1554,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     if (params.attention_prior_focus != nullptr) {
         focus = params.attention_prior_focus[batch_beam_idx];
     }
-    bool const apply_prior = params.apply_attention_prior && kv_loop_length > params.attention_prior_lookahead;
-    bool const store_scores = params.attention_prior_scores != nullptr && kv_loop_length > params.attention_prior_lookahead;
+    bool const store_scores = params.attention_prior_scores != nullptr;
     float *scores_ptr = nullptr;
     if (store_scores) {
         scores_ptr = &params.attention_prior_scores[batch_beam_idx * params.attention_prior_lookahead];
@@ -2288,7 +2287,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (!MULTI_BLOCK_FLAG)
         {
             float prob = qk_smem[ti] * inv_sum;
-            if (DO_CROSS_ATTENTION && params.attention_prior_focus != nullptr && apply_prior) {
+            if (DO_CROSS_ATTENTION && params.attention_prior_focus != nullptr) {
                 // do the masking to the prob
                 if (ti < (focus - params.attention_prior_window_left) || ti > (focus + params.attention_prior_window_right)) {
                     prob *= 0.1f;
@@ -2317,7 +2316,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // for the case when we apply prior, we need to perform additional normalization,
     // dividing by the sum of the modified probs.
     __syncthreads();
-    if (!MULTI_BLOCK_FLAG && DO_CROSS_ATTENTION && params.attention_prior_focus != nullptr && store_scores)
+    if (!MULTI_BLOCK_FLAG && DO_CROSS_ATTENTION && params.attention_prior_focus != nullptr)
     {
         sum_rescale = block_sum<WARPS_PER_BLOCK>(&red_smem[WARPS_PER_BLOCK], sum_rescale);
 

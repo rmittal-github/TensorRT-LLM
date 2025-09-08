@@ -89,6 +89,11 @@ public:
         return mBufferManager;
     }
 
+    [[nodiscard]] BufferManager const& getDecoderBufferManager() const
+    {
+        return mDecoderBufferManager;
+    }
+
 private:
     //! @brief Sets inputs for explicit draft tokens.
     void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
@@ -106,6 +111,7 @@ private:
     CudaStreamPtr mRuntimeStream;
     CudaStreamPtr mDecoderStream;
     BufferManager mBufferManager;
+    BufferManager mDecoderBufferManager;
 
     using GptDecoderPtr = std::unique_ptr<IGptDecoder>;
     GptDecoderPtr mDecoder;

@@ -52,6 +52,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/timestampUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/cfgKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
@@ -1918,25 +1919,58 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
-    runtime::CudaEvent decoderFinishEvent;
+    // first run handling of context and generation logits,
+    // this forwards the logit slices into decoder buffers, so decoders can be run
+    auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
+    auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
+    auto const logitsIndex = (*mHandleContextLogits)(scheduledRequests.contextRequests,
+        contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, mDecoderBuffers, mModelConfig,
+        mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->medusaBuffers);
+    auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
+    auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
+    auto& genRuntimeBuffers = mBuffers.at(genBufferId);
+    (*mHandleGenerationLogits)(genLogitsIndex, scheduledRequests.generationRequests, mDecoderBuffers,
+        mModelConfig, mRuntime->getBufferManager(), genRuntimeBuffers->logits, *genRuntimeBuffers);
+    
+    // copy cache indirection only for the first decoder, the rest is not used 
+    copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId, 0);
+
+    // apply cfg for generation logits
+    if (scheduledRequests.generationRequests.size() > 0) {
+        // check that all generation requests are cfg
+        bool allCfg = true;
+        bool hasCfg = false;
+        for (auto const& llmReq : scheduledRequests.generationRequests) {
+            allCfg &= llmReq->isCfg();
+            hasCfg |= llmReq->isCfg();
+        }
+        if (hasCfg) {
+            TLLM_CHECK_WITH_INFO(allCfg, "A kernel which allows to enable CFG per request is to be implemented");
+            // slice generation logits, assumes nTok=1 per request
+            TensorPtr genLogitsView = ITensor::slice(
+                contextRuntimeBuffers->logits,
+                genLogitsIndex,
+                scheduledRequests.generationRequests.size()
+            );
+            // compute total vocab size
+            SizeType32 totalVocabSize = 0;
+            for (auto const vs : mModelConfig.getVocabSizes()) {
+                totalVocabSize += vs;
+            }
+            float cfgScale = scheduledRequests.generationRequests.front()->mSamplingConfig.cfgScale->at(0);
+            tensorrt_llm::kernels::invokeCfg(
+                mRuntime->getStream(), genLogitsView,
+                scheduledRequests.generationRequests.size(), // numRequests
+                totalVocabSize,
+                cfgScale
+            );
+        }
+    }
+
+    // this is operations that we hopefully do no apply in multi-vocab sampling
+    // keep them separate just in case, because they are on the runtime stream
     for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
     {
-        auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
-        auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
-        auto const logitsIndex = (*mHandleContextLogits)(scheduledRequests.contextRequests,
-            contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, *mDecoderBuffers[vid], mModelConfig,
-            mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->medusaBuffers, vid);
-
-        auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
-        auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
-        auto& genRuntimeBuffers = mBuffers.at(genBufferId);
-        (*mHandleGenerationLogits)(genLogitsIndex, scheduledRequests.generationRequests, *mDecoderBuffers[vid],
-            mModelConfig, mRuntime->getBufferManager(), mRuntime->getStream(), genRuntimeBuffers->logits, *genRuntimeBuffers, vid);
-
-        // Copy indirection output into input
-        // TODO: Could we avoid this by modifying batchDecoder to take a vector of tensors instead?
-        copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId, vid);
-
         mLogitsPostProcessorIsApplied = (*mLogitsPostProcessor)(scheduledRequests.contextRequests,
             scheduledRequests.generationRequests, mReplicateLogitsPostProcessor, *mDecoderBuffers[vid], mWorldConfig,
             *mRuntime, mLogitsPostProcessorBatched);
@@ -1945,31 +1979,42 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
         {
             mGuidedDecoder->execute(scheduledRequests, mRuntime->getBufferManager(), mDecoderBuffers[vid]->logits);
         }
+    }
 
-        auto const fusedBufferId = getFusedBufferId();
-        auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);
 
+    // finally run actual decoding
+    // each decoder runs on a dedicated stream
+    auto const fusedBufferId = getFusedBufferId();
+    auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);
+    std::vector<CudaEvent> finishedEvents;
+    for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
+    {
+        if (vid == 0) {
+            // wait for runtime stream to finish
+            auto event = CudaEvent{};
+            mRuntime->getStream().record(event);
+            mDecoders[vid]->getDecoderStream()->wait(event.get());
+        }
+        
         auto& decodingInput = mDecodingInputs[vid].at(mMicroBatchId);
         std::tie(decodingInput, mDecodingOutput[vid])
             = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests, scheduledRequests.generationRequests,
                 *mDecoderBuffers[vid], mDecoderInputBuffers.at(fusedBufferId), mDecoders[vid]->getDecoderState(),
-                mModelConfig, getMaxNumSequences(), mOperatingBeamWidth, mRuntime->getBufferManager(),
-                mRuntime->getStream(), *fusedRuntimeBuffers);
+                mModelConfig, getMaxNumSequences(), mOperatingBeamWidth, mDecoders[vid]->getDecoderBufferManager(),
+                *mDecoders[vid]->getDecoderStream(), *fusedRuntimeBuffers);
 
-        runtime::CudaEvent finishedEvent = mDecoders[vid]->forwardAsync(*mDecodingOutput[vid], *decodingInput);
-
+        [[maybe_unused]] auto unusedEvent = mDecoders[vid]->forwardAsync(*mDecodingOutput[vid], *decodingInput);
         auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
-        finishedEvent = updateDecoderBuffers(returnLogProbs, std::move(finishedEvent), vid);
-        if (vid == getNumVocabs() - 1)
-        {
-            decoderFinishEvent = std::move(finishedEvent);
-            // All decoders use the same cuda stream for now. The last finished event indicates all decoder finish
-            // decoding
-        }
+        TLLM_CHECK_WITH_INFO(!returnLogProbs || getNumVocabs() == 1, "Can't return log probs for multi-vocab");
+        finishedEvents.push_back(updateDecoderBuffers(returnLogProbs, mDecoders[vid]->getDecoderBufferManager(), vid));
+    }
+
+    for (auto const& event : finishedEvents) {
+        mRuntime->getStream().wait(event.get());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return decoderFinishEvent;
+    return std::move(finishedEvents.back());
 }
 
 void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
@@ -2031,29 +2076,29 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
 }
 
 runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
-    bool returnLogProbs, runtime::CudaEvent decoderFinishEvent, SizeType32 vocabId)
+    bool returnLogProbs, runtime::BufferManager const& manager, SizeType32 vocabId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(updateDecoderBuffers);
 
-    // Chain copy after decoder event, using a different stream
-    mCopyBufferManager.getStream().wait(decoderFinishEvent);
-
-    mCopyBufferManager.copy(
+    manager.copy(
         *mDecoders[vocabId]->getDecoderState().getAllNewTokens(), *mDecoderBuffers[vocabId]->newOutputTokensHost);
-    mCopyBufferManager.copy(*mDecoders[vocabId]->getDecoderState().getJointDecodingOutput().lengths,
+    manager.copy(*mDecoders[vocabId]->getDecoderState().getJointDecodingOutput().lengths,
         *mDecoderBuffers[vocabId]->sequenceLengthsHost);
 
-    auto const finishedSumDevice = mDecoders[vocabId]->getDecoderState().getFinishedSum();
-    mCopyBufferManager.copy(*finishedSumDevice, *mDecoderBuffers[vocabId]->finishedSumHost);
-    auto const finishReasonsDevice = mDecoders[vocabId]->getDecoderState().getFinishReasons();
-    mCopyBufferManager.copy(*finishReasonsDevice, *mDecoderBuffers[vocabId]->finishReasonsHost);
+    if (vocabId == 0) {
+        // no need to copy those for all the vocabs
+        auto const finishedSumDevice = mDecoders[vocabId]->getDecoderState().getFinishedSum();
+        manager.copy(*finishedSumDevice, *mDecoderBuffers[vocabId]->finishedSumHost);
+        auto const finishReasonsDevice = mDecoders[vocabId]->getDecoderState().getFinishReasons();
+        manager.copy(*finishReasonsDevice, *mDecoderBuffers[vocabId]->finishReasonsHost);
+    }
 
     if (returnLogProbs)
     {
-        mCopyBufferManager.copy(
+        manager.copy(
             *mDecoders[vocabId]->getDecoderState().getCumLogProbs(), *mDecoderBuffers[vocabId]->cumLogProbsHost);
-        mCopyBufferManager.copy(
+            manager.copy(
             *mDecoders[vocabId]->getDecoderState().getLogProbs(), *mDecoderBuffers[vocabId]->logProbsHost);
     }
 
@@ -2062,7 +2107,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
         // TODO: keep data on device for next iteration
         mDecoderBuffers[vocabId]->draftBuffers.nextDraftTokensDevice
             = mDecoders[vocabId]->getDecoderState().getNextDraftTokens();
-        mCopyBufferManager.copy(*mDecoderBuffers[vocabId]->draftBuffers.nextDraftTokensDevice,
+            manager.copy(*mDecoderBuffers[vocabId]->draftBuffers.nextDraftTokensDevice,
             *mDecoderBuffers[vocabId]->draftBuffers.nextDraftTokensHost);
 
         if (mModelConfig.getSpeculativeDecodingMode().variableDraftLength())
@@ -2071,9 +2116,9 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
                 = mDecoders[vocabId]->getDecoderState().getNextDraftTokensLengths();
             mDecoderBuffers[vocabId]->draftBuffers.prevDraftTokensLengthsDevice
                 = mDecoders[vocabId]->getDecoderState().getPrevDraftTokensLengths();
-            mCopyBufferManager.copy(*mDecoderBuffers[vocabId]->draftBuffers.nextDraftTokensLengthsDevice,
+            manager.copy(*mDecoderBuffers[vocabId]->draftBuffers.nextDraftTokensLengthsDevice,
                 *mDecoderBuffers[vocabId]->draftBuffers.nextDraftTokensLengthsHost);
-            mCopyBufferManager.copy(*mDecoderBuffers[vocabId]->draftBuffers.prevDraftTokensLengthsDevice,
+            manager.copy(*mDecoderBuffers[vocabId]->draftBuffers.prevDraftTokensLengthsDevice,
                 *mDecoderBuffers[vocabId]->draftBuffers.prevDraftTokensLengthsHost);
         }
     }
@@ -2087,7 +2132,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
     }
 
     runtime::CudaEvent copyEvent{};
-    mCopyBufferManager.getStream().record(copyEvent);
+    manager.getStream().record(copyEvent);
     // Store the event for later sync. Sync stream before calling next decoder. Sync host before updating requests.
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return copyEvent;

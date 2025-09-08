@@ -104,7 +104,8 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             "__call__",
             [](HandleContextLogits const& self, RequestVector const& contextRequests,
                 std::vector<tr::SizeType32> const& numContextLogitsVec, at::Tensor const& logits,
-                DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
+                std::vector<std::shared_ptr<DecoderBuffers>>& decoderBuffers,
+		tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
                 tensorrt_llm::runtime::CudaStream const& stream,
                 OptionalRef<MedusaBuffers> medusaBuffers = std::nullopt)
             {
@@ -121,15 +122,15 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
         .def(
             "__call__",
             [](HandleGenerationLogits const& self, tr::SizeType32 logitsIndex, RequestVector const& generationRequests,
-                DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-                tensorrt_llm::runtime::CudaStream const& stream,
+                std::vector<std::shared_ptr<DecoderBuffers>>& decoderBuffers,
+		tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
                 at::Tensor const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers = std::nullopt)
             {
-                self(logitsIndex, generationRequests, decoderBuffers, modelConfig, manager, stream,
+                self(logitsIndex, generationRequests, decoderBuffers, modelConfig, manager,
                     tr::TorchView::of(logits), genRuntimeBuffers);
             },
             py::arg("logits_index"), py::arg("generation_requests"), py::arg("decoder_buffers"),
-            py::arg("model_config"), py::arg("buffer_manager"), py::arg("stream"), py::arg("logits"),
+            py::arg("model_config"), py::arg("buffer_manager"), py::arg("logits"),
             py::arg("gen_runtime_buffers") = std::nullopt)
         .def("name", [](HandleGenerationLogits const&) { return HandleGenerationLogits::name; });
 

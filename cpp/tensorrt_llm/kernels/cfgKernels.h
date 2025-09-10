@@ -1,60 +1,63 @@
 #pragma once
 
-#include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include <cublas_v2.h>
-#include <cuda_fp16.h>
+#include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm::kernels
 {
 
-//! Apply classifier-free guidance (CFG) on GPU in-place using cuBLAS.
-//! It overwrites `logitsView` with: logits = cfgScale * logits + (1 - cfgScale) * uncondLogits
-//! Only the slice [vocabOffset, vocabOffset + vocabSize) is modified.
+/**
+ * @brief Forward declaration for the templated kernel launcher.
+ *
+ * The full definition of this function resides in the .cu file and is compiled by NVCC.
+ * This declaration makes it visible to the inline `invokeCfg` function below.
+ */
+template <typename T>
+void invokeCfgKernel(T* logits, int const numRequests, int const vocabSize, float const cfgScale, cudaStream_t stream);
+
+/**
+ * @brief Applies classifier-free guidance (CFG) to the logits tensor in-place on the GPU.
+ *
+ * This function is the main entry point for the CFG operation. It is a type-dispatcher
+ * that calls the appropriate templated kernel launcher based on the data type of the logits tensor.
+ *
+ * @details The formula applied is:
+ * `logits_cond = cfgScale * logits_cond + (1 - cfgScale) * logits_uncond`
+ *
+ * The input logits tensor is expected to have a shape that can be interpreted as
+ * [numRequests, 2, vocabSize], where logits[i, 0, :] are the conditional logits and
+ * logits[i, 1, :] are the unconditional logits. The result is written back into the
+ * conditional logits' location. For efficiency, the implementation treats the tensor
+ * as having the shape [numRequests * 2, vocabSize].
+ *
+ * @param stream The CUDA stream to execute the kernel on.
+ * @param logitsView A shared pointer to the tensor containing both conditional and
+ * unconditional logits. The tensor is modified in-place.
+ * @param numRequests The number of requests in the batch.
+ * @param vocabSize The size of the vocabulary.
+ * @param cfgScale The guidance scale factor. A value of 1.0 effectively disables CFG.
+ */
 inline void invokeCfg(tensorrt_llm::runtime::CudaStream const& stream,
-    runtime::ITensor::SharedPtr logitsView, runtime::ITensor::SharedPtr uncondLogitsView,
-    float cfgScale, runtime::SizeType32 vocabOffset, runtime::SizeType32 vocabSize)
+    runtime::ITensor::SharedPtr logitsView, int numRequests, int vocabSize, float cfgScale)
 {
-    using TensorPtr = runtime::ITensor::SharedPtr;
+    auto const& logitsDataType = logitsView->getDataType();
 
-    // Restrict to current vocabulary segment.
-    TensorPtr logitsVocabView = runtime::ITensor::slice(logitsView, {0, vocabOffset}, vocabSize);
-    TensorPtr uncondLogitsVocabView = runtime::ITensor::slice(uncondLogitsView, {0, vocabOffset}, vocabSize);
-
-    void* condPtr = logitsVocabView->data();
-    void const* uncondPtr = uncondLogitsVocabView->data();
-
-    cudaDataType_t dataType{};
-    switch (logitsVocabView->getDataType())
+    if (logitsDataType == nvinfer1::DataType::kFLOAT)
     {
-    case nvinfer1::DataType::kFLOAT: dataType = CUDA_R_32F; break;
-    case nvinfer1::DataType::kHALF: dataType = CUDA_R_16F; break;
-    default: TLLM_THROW("Unsupported data type for CFG");
+        invokeCfgKernel(runtime::bufferCast<float>(*logitsView),
+            numRequests, vocabSize, cfgScale, stream.get());
     }
-
-    auto handlePtr = getCublasHandle();
-    auto& handle = *handlePtr;
-    tensorrt_llm::common::check_cuda_error(cublasSetStream(handle, stream.get()));
-
-    int n = static_cast<int>(vocabSize);
-    int inc = 1;
-
-    // Use float for the scaling factors and always accumulate in FP32 to
-    // satisfy cuBLAS requirements (FP16 vectors must use FP32 compute/alpha).
-    float alphaF = cfgScale;                 // Scaling factor in FP32
-    float axpyF  = 1.0f - cfgScale;          // (1 - cfgScale) in FP32
-
-    tensorrt_llm::common::check_cuda_error(
-        cublasScalEx(handle, n, &alphaF, CUDA_R_32F,   // alpha
-                       condPtr, dataType,             // x and its type
-                       inc, CUDA_R_32F));            // increments + compute type
-
-    tensorrt_llm::common::check_cuda_error(
-        cublasAxpyEx(handle, n, &axpyF, CUDA_R_32F,    // alpha
-                     uncondPtr, dataType, inc,        // x
-                     condPtr,   dataType, inc,        // y
-                     CUDA_R_32F));                   // compute type
+    else if (logitsDataType == nvinfer1::DataType::kHALF)
+    {
+        invokeCfgKernel(runtime::bufferCast<half>(*logitsView),
+            numRequests, vocabSize, cfgScale, stream.get());
+    }
+    else
+    {
+        TLLM_THROW("Unsupported data type for CFG. Only float and half are supported.");
+    }
 }
 
 } // namespace tensorrt_llm::kernels

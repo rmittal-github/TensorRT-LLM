@@ -37,7 +37,9 @@ using namespace tensorrt_llm::runtime;
 GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream,
     SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype)
     : mRuntimeStream{std::move(stream)}
+    , mDecoderStream{std::make_shared<CudaStream>()}
     , mBufferManager{mRuntimeStream}
+    , mDecoderBufferManager{mDecoderStream}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -108,7 +110,6 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     }
 
     auto const device = mRuntimeStream->getDevice();
-    mDecoderStream = std::make_shared<CudaStream>();
     TLLM_CHECK(mDecoderStream->getDevice() == device);
 
     if (vocabSize == 0)
@@ -189,20 +190,12 @@ CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto eventStart = CudaEvent{};
-    mRuntimeStream->record(eventStart);
-    mDecoderStream->wait(eventStart.get());
-
     forwardDispatch(output, input);
 
     CudaEvent event{};
     mDecoderStream->record(event);
-    mRuntimeStream->wait(event);
-
-    CudaEvent eventStop{};
-    mRuntimeStream->record(eventStop);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return eventStop;
+    return event;
 }
 
 // TODO: produce new input and output

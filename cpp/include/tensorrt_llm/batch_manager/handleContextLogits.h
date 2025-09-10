@@ -49,9 +49,9 @@ public:
 
     tr::SizeType32 operator()(RequestVector const& contextRequests,
         std::vector<tr::SizeType32> const& numContextLogitsVec, tr::ITensor::SharedPtr const& logits,
-        DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-        tensorrt_llm::runtime::CudaStream const& stream, OptionalRef<MedusaBuffers> medusaBuffers,
-        tr::SizeType32 vocabId = 0) const;
+        std::vector<std::shared_ptr<DecoderBuffers>>& decoderBuffers,
+        tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
+        tensorrt_llm::runtime::CudaStream const& stream, OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

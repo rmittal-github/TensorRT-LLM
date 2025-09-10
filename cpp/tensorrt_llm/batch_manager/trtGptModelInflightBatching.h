@@ -286,7 +286,7 @@ private:
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
     runtime::CudaEvent updateDecoderBuffers(
-        bool returnLogProbs, runtime::CudaEvent decoderFinishEvent, SizeType32 vocabId = 0);
+        bool returnLogProbs, runtime::BufferManager const& manager, SizeType32 vocabId = 0);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 

@@ -25,7 +25,6 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
-#include "tensorrt_llm/kernels/cfgKernels.h"
 
 namespace tru = tensorrt_llm::runtime::utils;
 
@@ -69,15 +68,17 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 } // namespace
 
 SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
-    std::vector<SizeType32> const& numContextLogitsVec, TensorPtr const& logits, DecoderBuffers& decoderBuffers,
+    std::vector<SizeType32> const& numContextLogitsVec, TensorPtr const& logits,
+    std::vector<std::shared_ptr<DecoderBuffers>>& decoderBuffers,
     tr::ModelConfig const& modelConfig, BufferManager const& manager, tensorrt_llm::runtime::CudaStream const& stream,
-    OptionalRef<MedusaBuffers> medusaBuffers, SizeType32 vocabId) const
+    OptionalRef<MedusaBuffers> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleContextLogits);
 
     SizeType32 batchIndex{0};
     SizeType32 logitsIndex{0};
+    auto vocabSizes = modelConfig.getVocabSizes();
     // Copy logits into decoderBuffers.logits
     for (auto const& llmReq : contextRequests)
     {
@@ -91,6 +92,7 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
 
         if (modelConfig.computeContextLogits())
         {
+            TLLM_CHECK_WITH_INFO(vocabSizes.size() == 1, "Multi-vocab does not support context logits");
             // Since the computational graph has been modified, only the last token is needed.
             TLLM_CHECK_WITH_INFO(!modelConfig.getSpeculativeDecodingMode().isMedusa()
                     && !modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding(),
@@ -117,28 +119,13 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         auto const numDecoderLogits = 1 + draftLength;
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex - numDecoderLogits, numDecoderLogits);
 
-        // this is CFG support implementation, where we advance the logits index through the unconditional logits
-        if (llmReq->isCfg()) {
-            logitsIndex += numContextLogits + draftLength;
-            TensorPtr uncondLogitsView = ITensor::slice(logits, logitsIndex - numDecoderLogits, numDecoderLogits);
-            // TODO: implement CFG, apply logitsView = logitsView * cfgScale + uncondLogitsView * (1 - cfgScale)
-
-            float cfgScale = llmReq->mSamplingConfig.cfgScale->at(0);
-            SizeType32 vocabOffset = 0;
-            auto vocabSizes = modelConfig.getVocabSizes();
-            for (SizeType32 i = 0; i < vocabId; ++i)
-            {
-                vocabOffset += vocabSizes[i];
-            }
-            tensorrt_llm::kernels::invokeCfg(stream, logitsView, uncondLogitsView, cfgScale, vocabOffset, vocabSizes[vocabId]);
-        }
-
         auto const seqSlot = llmReq->mSeqSlots.at(0);
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
+            TLLM_CHECK_WITH_INFO(vocabSizes.size() == 1, "Multi-vocab does not support speculative decoding");
             TLLM_CHECK(medusaBuffers);
             // speculative decoding is not supported for numVocabs > 1
-            auto& medusaLogitsHeads = decoderBuffers.draftBuffers.predictedDraftLogits.at(seqSlot);
+            auto& medusaLogitsHeads = decoderBuffers.front()->draftBuffers.predictedDraftLogits.at(seqSlot);
             setupMedusaLogits(medusaLogitsHeads, medusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex - numDecoderLogits,
                 numDecoderLogits);
@@ -148,45 +135,48 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         // save the accepted token logits from target model
         if (llmReq->getReturnGenerationLogits())
         {
+            TLLM_CHECK_WITH_INFO(vocabSizes.size() == 1, "Multi-vocab does not support returning generation logits");
             copyLastContextLogits(logitsView, *llmReq, manager);
         }
 
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
 
-        auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
-
         if (reqBeamWidth > 1)
         {
             // Tile logits of context requests
+            TLLM_CHECK_WITH_INFO(vocabSizes.size() == 1, "Multi-vocab does not support beam search");
             auto const logitsShape = logitsView->getShape();
             auto const logitsType = logitsView->getDataType();
+            auto& decoderLogits = decoderBuffers.front()->logits.at(seqSlot);
             decoderLogits = manager.gpu(ITensor::makeShape({reqBeamWidth, logitsShape.d[1]}), logitsType);
             tensorrt_llm::runtime::kernels::tileTensor(*decoderLogits, *logitsView, reqBeamWidth, stream);
             decoderLogits->unsqueeze(0);
         }
         else
         {
-            auto curVocablogitsView = logitsView;
+            // iterate through vocabs and assign the logits to the decoder buffers
+            SizeType32 offset = 0;
             auto const logitsViewShape = logitsView->getShape();
-            if (logitsViewShape.d[0] == 1) // if current nTok is 1, could have multiple vocabs
-            {
-                SizeType32 offset = 0;
-                auto vocabSizes = modelConfig.getVocabSizes();
-                for (SizeType32 i = 0; i < vocabId; ++i)
-                {
-                    offset += vocabSizes[i];
-                }
-                curVocablogitsView = ITensor::slice(logitsView, {0, offset}, vocabSizes[vocabId]); // [vocabSize,]
-                curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, vocabSizes[vocabId]}));
+            TLLM_CHECK_WITH_INFO(logitsViewShape.d[0] == 1, "nTok should be 1 for multi-vocab");
+            for (SizeType32 vocabId = 0; vocabId < (SizeType32)vocabSizes.size(); ++vocabId) {
+                // thats where we store a slice of logits to
+                auto& decoderLogits = decoderBuffers[vocabId]->logits.at(seqSlot);
+                auto curVocabLogitsView = logitsView;
+                curVocabLogitsView = ITensor::slice(logitsView, {0, offset}, vocabSizes[vocabId]); // [vocabSize,]
+                // not sure why
+                curVocabLogitsView = ITensor::view(curVocabLogitsView, ITensor::makeShape({1, vocabSizes[vocabId]}));
+                auto const updateLogitsViewShape = curVocabLogitsView->getShape();
+                // assign
+                decoderLogits = ITensor::view(
+                    curVocabLogitsView, ITensor::makeShape({updateLogitsViewShape.d[0], 1, updateLogitsViewShape.d[1]}));
+                offset += (SizeType32)vocabSizes[vocabId];
             }
-            auto const updateLogitsViewShape = curVocablogitsView->getShape();
-            decoderLogits = ITensor::view(
-                curVocablogitsView, ITensor::makeShape({updateLogitsViewShape.d[0], 1, updateLogitsViewShape.d[1]}));
         }
         ++batchIndex;
         if (llmReq->isCfg()) {
             ++batchIndex;
+            logitsIndex += numContextLogits + draftLength;
         }
     }
 

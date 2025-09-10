@@ -11,7 +11,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 def main():
     np.set_printoptions(threshold=np.inf)  # Ensure full array is printed
     runner = ModelRunnerCpp.from_dir(
-        engine_dir='newmodels/magpie_engine/decoder',
+        engine_dir='checkpoints/magpie_engine/decoder',
         is_enc_dec=False,
         max_input_len=512,
         rank=0,
@@ -21,22 +21,22 @@ def main():
         kv_cache_free_gpu_memory_fraction=0.7,
     )
 
-    encoder_encodings = torch.tensor(np.load("/code/tensorrt_llm/multilingual_inputs/text.npy")[0]).to(torch.float16)
+    encoder_encodings = torch.tensor(np.load("/code/tensorrt_llm/inputs/encoder_outputs_0.npy")).to(torch.float16)
     print(f"Encoder embeddings: {str(encoder_encodings.shape)}")
 
     books_num = 8
     book_size = 2024
-    decoder_encodings = torch.tensor(np.load("/code/tensorrt_llm/multilingual_inputs/context.npy")[0]).to(torch.float16)
+    decoder_encodings = torch.load("/code/tensorrt_llm/inputs/zh_es_en_fr.pt")[84][0].to(torch.float16)
     print(f"Context embeddings: {str(decoder_encodings.shape)}")
     dummy_context_tokens = torch.tensor([0] * decoder_encodings.shape[0] * books_num, dtype=torch.int32)
 
-
+    bs = 1
     for run_idx in range(1):
         with torch.no_grad():
             outputs = runner.generate(
-                batch_input_ids=[dummy_context_tokens] * 16,
-                encoder_input_features=[encoder_encodings] * 16,
-                decoder_context_features=[decoder_encodings] * 16,
+                batch_input_ids=[dummy_context_tokens] * bs,
+                encoder_input_features=[encoder_encodings] * bs,
+                decoder_context_features=[decoder_encodings] * bs,
                 max_new_tokens=440,
                 end_id=2017,
                 pad_id=2017,

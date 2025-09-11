@@ -36,6 +36,8 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/executor/version.h"
+#include "tensorrt_llm/batch_manager/trtLocalTransformer.h"
+#include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -278,6 +280,34 @@ void Executor::Impl::loadModel(std::optional<std::filesystem::path> const& model
     else
     {
         mModel = createModel(rawEngine, modelConfig, worldConfig, executorConfig);
+
+        // Create a local transformer model on top of a hardcoded path. Placeholder to be replaced by user.
+        try
+        {
+            auto const placeholderEnginePath = std::filesystem::path("/path/to/local_transformer/engine.plan");
+            if (std::filesystem::exists(placeholderEnginePath))
+            {
+                auto localRawEngine = runtime::RawEngine(placeholderEnginePath);
+                auto localTransformer = std::make_shared<batch_manager::TrtLocalTransformer>(
+                    worldConfig, localRawEngine, std::make_shared<runtime::TllmLogger>());
+
+                // If decoder model is inflight batching, inject the local transformer so it can be used during decoding
+                if (auto inflightPtr = std::dynamic_pointer_cast<batch_manager::TrtGptModelInflightBatching>(mModel))
+                {
+                    inflightPtr->setLocalTransformer(localTransformer);
+                }
+            }
+            else
+            {
+                TLLM_LOG_WARNING(
+                    "TrtLocalTransformer engine not found at placeholder path. Replace with actual engine path.");
+            }
+        }
+        catch (std::exception const&)
+        {
+            // Non-fatal: proceed without local transformer
+            TLLM_LOG_WARNING("Failed to initialize TrtLocalTransformer. Decoding continues without it.");
+        }
     }
 };
 

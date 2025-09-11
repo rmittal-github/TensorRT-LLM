@@ -49,6 +49,7 @@ set(SRCS
     sequenceSlotManager.cpp
     transformerBuffers.cpp
     trtEncoderModel.cpp
+    trtLocalTransformer.cpp
     trtGptModelInflightBatching.cpp
     trtGptModelV1.cpp
     utils/debugUtils.cpp

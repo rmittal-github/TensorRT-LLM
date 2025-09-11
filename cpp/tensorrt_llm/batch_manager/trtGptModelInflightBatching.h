@@ -27,6 +27,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include "trtGptModel.h"
+#include "tensorrt_llm/batch_manager/trtLocalTransformer.h"
 
 #include <NvInferRuntime.h>
 
@@ -188,6 +189,11 @@ public:
     runtime::SpeculativeDecodingMode getSpeculativeDecodingMode() const noexcept
     {
         return mModelConfig.getSpeculativeDecodingMode();
+    }
+
+    void setLocalTransformer(std::shared_ptr<TrtLocalTransformer> localTransformer)
+    {
+        mLocalTransformer = std::move(localTransformer);
     }
 
 private:
@@ -443,6 +449,8 @@ private:
     std::vector<std::shared_ptr<runtime::GptDecoderBatched>> mDecoders;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
+    // optional local transformer to do auto-regressive multi-vocab sampling
+    std::shared_ptr<TrtLocalTransformer> mLocalTransformer;
 
     // Manager that maps requests to slots
     std::shared_ptr<SequenceSlotManager> mSeqSlotManager;
@@ -566,6 +574,7 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::LogitsPostProcessor const> mLogitsPostProcessor;
     std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
     std::unique_ptr<tensorrt_llm::batch_manager::CreateNewDecoderRequests const> mCreateNewDecoderRequests;
+
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -1918,6 +1918,16 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
+    // run local transformer to test if it runs correctly
+    auto const buffId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
+    auto& buf = mBuffers.at(buffId);
+    mLocalTransformer->run(
+        buf->logits,
+        scheduledRequests.contextRequests,
+        buf->numContextLogits,
+        scheduledRequests.generationRequests
+    );
+
     runtime::CudaEvent decoderFinishEvent;
     for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
     {

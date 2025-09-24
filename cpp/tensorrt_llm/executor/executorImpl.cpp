@@ -284,7 +284,7 @@ void Executor::Impl::loadModel(std::optional<std::filesystem::path> const& model
         // Create a local transformer model on top of a hardcoded path. Placeholder to be replaced by user.
         try
         {
-            auto const placeholderEnginePath = std::filesystem::path("/path/to/local_transformer/engine.plan");
+            auto const placeholderEnginePath = std::filesystem::path("/code/tensorrt_llm/local_transformer.trt");
             if (std::filesystem::exists(placeholderEnginePath))
             {
                 auto localRawEngine = runtime::RawEngine(placeholderEnginePath);

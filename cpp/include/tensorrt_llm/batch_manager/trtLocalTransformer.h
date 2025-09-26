@@ -24,12 +24,21 @@
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 
 #include <NvInferRuntime.h>
 #include <memory>
 
+namespace tensorrt_llm::runtime
+{
+class GptDecoderBatched;
+}
+
 namespace tensorrt_llm::batch_manager
 {
+class DecoderInputBuffers;
+class DecoderBuffers;
+class MakeDecodingBatchInputOutput;
 
 class TrtLocalTransformer
 {
@@ -42,19 +51,32 @@ public:
     static constexpr auto kInTokensTensorName = "tokens";
     static constexpr auto kOutLogitsTensorName = "logits";
 
-    TrtLocalTransformer(runtime::WorldConfig const& worldConfig,
+    TrtLocalTransformer(
+        runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig,
         runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger);
+    
+    ~TrtLocalTransformer();
 
     /// \brief Run the local transformer using hiddenStates and current request sets.
     void run(TensorPtr const& hiddenStates,
         RequestVector const& contextRequests,
         std::vector<SizeType32> const& numContextFramesVec,
-        RequestVector const& generationRequests);
+        RequestVector const& generationRequests,
+        // TODO: create those inside local transformer
+        std::shared_ptr<runtime::GptDecoderBatched> &decoder,
+        std::unique_ptr<runtime::decoder_batch::Input> &decodingInput,
+        std::unique_ptr<runtime::decoder_batch::Output> &decodingOutput,
+        DecoderInputBuffers &decoderInputBuffers,
+        std::shared_ptr<DecoderBuffers> &decoderBuffers,
+        SizeType32 maxNumSequences
+    );
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const;
     [[nodiscard]] runtime::BufferManager::CudaStreamPtr getRuntimeStreamPtr() const;
 
 private:
+    runtime::ModelConfig mModelConfig;
     runtime::WorldConfig mWorldConfig;
     int mDevice{-1};
     std::shared_ptr<runtime::TllmRuntime> mRuntime;
@@ -68,6 +90,14 @@ private:
     TensorPtr outLogitsHost;  // [batch' x VocabSize]
     TensorMap inputMap;
     TensorMap outputMap;
+
+    std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
+
+    void HandleLogits(
+        RequestVector const& contextRequests,
+        RequestVector const& generationRequests,
+        std::shared_ptr<DecoderBuffers> &decoderBuffers
+    );
 };
 
 } // namespace tensorrt_llm::batch_manager

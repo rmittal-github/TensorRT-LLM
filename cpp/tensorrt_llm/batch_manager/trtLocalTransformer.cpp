@@ -21,9 +21,13 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
+#include "tensorrt_llm/batch_manager/makeDecodingBatchInputOutput.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 
 namespace tensorrt_llm::batch_manager
 {
@@ -31,9 +35,11 @@ namespace tensorrt_llm::batch_manager
 using namespace tensorrt_llm::runtime;
 
 TrtLocalTransformer::TrtLocalTransformer(
+    runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, runtime::RawEngine const& rawEngine,
     std::shared_ptr<nvinfer1::ILogger> logger)
-    : mWorldConfig{worldConfig}
+    : mModelConfig{modelConfig}
+    , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}
     , mRuntime{std::make_shared<TllmRuntime>(rawEngine, logger.get(), 1.0f)}
     , hiddenSize{16192}  // TODO: change to 768 once switch to use hidden state instead of logits from model
@@ -44,19 +50,51 @@ TrtLocalTransformer::TrtLocalTransformer(
     mRuntime->clearContexts();
     mRuntime->addContext(0);
 
+    auto& manager = getBufferManager();
     auto const statesType = mRuntime->getEngine().getTensorDataType(kInHiddenStatesTensorName);
-    inHiddenStates = mRuntime->getBufferManager().emptyTensor(MemoryType::kGPU, statesType);
-    inTokens = mRuntime->getBufferManager().emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    inHiddenStates = manager.emptyTensor(MemoryType::kGPU, statesType);
+    inTokens = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
     auto const logitsType = mRuntime->getEngine().getTensorDataType(kOutLogitsTensorName);
-    outLogits = mRuntime->getBufferManager().emptyTensor(MemoryType::kGPU, logitsType);
-    outLogitsHost = mRuntime->getBufferManager().emptyTensor(MemoryType::kCPU, logitsType);
+    outLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
+    outLogitsHost = manager.emptyTensor(MemoryType::kCPU, logitsType);
 }
+
+TrtLocalTransformer::~TrtLocalTransformer()
+{
+}
+
+void TrtLocalTransformer::HandleLogits(
+    RequestVector const& contextRequests,
+    RequestVector const& generationRequests,
+    std::shared_ptr<DecoderBuffers> &decoderBuffers
+) {
+    // forward the logits to the decoder buffers
+    SizeType32 batchIndex{0};
+    for (auto const& requests : {contextRequests, generationRequests})
+    {
+        for (auto const& llmReq : requests)
+        {
+            auto const seqSlot = llmReq->mSeqSlots.at(0);
+            auto& decoderLogits = decoderBuffers->logits.at(seqSlot);
+            TensorPtr logitsView = ITensor::slice(outLogits, batchIndex, 1);
+            decoderLogits = ITensor::view(logitsView, ITensor::makeShape({1, 1, vocabSize}));
+            batchIndex++;
+        }
+    }
+}
+
 
 void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
     RequestVector const& contextRequests,
     std::vector<SizeType32> const& numContextFramesVec,
-    RequestVector const& generationRequests)
-{
+    RequestVector const& generationRequests,
+    std::shared_ptr<runtime::GptDecoderBatched> &decoder,
+    std::unique_ptr<runtime::decoder_batch::Input> &decodingInput,
+    std::unique_ptr<runtime::decoder_batch::Output> &decodingOutput,
+    DecoderInputBuffers &decoderInputBuffers,
+    std::shared_ptr<DecoderBuffers> &decoderBuffers,
+    SizeType32 maxNumSequences
+) {
     // reshape input hidden states based on the inputs and fill it in using requests
     // check that all requests are actually cfg
     bool allCfg = true;
@@ -78,11 +116,9 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
     // overall batch size
     auto const batchSize = (int)(contextRequests.size() + generationRequests.size()) * cfgMult;
 
-    auto& manager = mRuntime->getBufferManager();
+    auto& manager = getBufferManager();
     auto const statesType = mRuntime->getEngine().getTensorDataType(kInHiddenStatesTensorName);
     inHiddenStates = manager.gpu(ITensor::makeShape({batchSize, hiddenSize}), statesType);
-    TLLM_LOG_WARNING(">>>>hidden states buffer size: %d x %d", batchSize, hiddenSize);
-    TLLM_LOG_WARNING(">>>>shape of hidden states passed in: %d x %d", hiddenStates->getShape().d[0], hiddenStates->getShape().d[1]);
 
     // for context requests, copy the hidden states into the input buffer
     SizeType32 batchIndex{0};
@@ -101,9 +137,7 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
             auto const numFrames = 1;
             TensorPtr statesView = ITensor::slice(hiddenStates, frameIndex - numFrames, numFrames);
             TensorPtr outStatesView = ITensor::slice(inHiddenStates, batchIndex, numFrames);
-            TLLM_LOG_WARNING(">>>>trying to copy context states, frame_idx=%d", frameIndex);
             manager.copy(*statesView, *outStatesView);
-            TLLM_LOG_WARNING(">>>>copying context states cfg_idx=%d, frame_idx=%d, batch_idx=%d", i, frameIndex, batchIndex);
             batchIndex += numFrames;
         }
     }
@@ -113,20 +147,15 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
         TensorPtr genStatesView = ITensor::slice(hiddenStates, frameIndex, generationRequests.size() * cfgMult);
         TensorPtr outGenStatesView = ITensor::slice(inHiddenStates, batchIndex, generationRequests.size() * cfgMult);
         manager.copy(*genStatesView, *outGenStatesView);
-        TLLM_LOG_WARNING(">>>>copying generation states frame_idx=%d, batch_idx=%d, total num frames=%d", frameIndex, batchIndex, generationRequests.size() * cfgMult);
     }
-    TLLM_LOG_WARNING(">>>Prepared hidden states buffer");
 
     // create a buffer for the tokens, 0th token reserved for hidden states
     inTokens = manager.gpu(ITensor::makeShape({numTokens + 1, batchSize / cfgMult}), nvinfer1::DataType::kINT32);
     // TODO: set intokens[0] to special token which is expanded to 0 with emb of local transformer
-    TLLM_LOG_WARNING(">>>>created in tokens buf: %d x %d", inTokens->getShape().d[0], inTokens->getShape().d[1]);
     // for CFG, model folds the tensor in two
     auto const logitsType = mRuntime->getEngine().getTensorDataType(kOutLogitsTensorName);
     outLogits = manager.gpu(ITensor::makeShape({batchSize / cfgMult, vocabSize}), logitsType);
-    TLLM_LOG_WARNING(">>>>created logits buf: %d x %d", outLogits->getShape().d[0], outLogits->getShape().d[1]);
     outLogitsHost = manager.cpu(ITensor::makeShape({batchSize / cfgMult, vocabSize}), logitsType);
-    TLLM_LOG_WARNING(">>>>created logits cpu buf: %d x %d", outLogitsHost->getShape().d[0], outLogitsHost->getShape().d[1]);
 
     inputMap.clear();
     outputMap.clear();
@@ -141,11 +170,8 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
         inputMap.insert_or_assign(kInTokensTensorName, prevTokensView);
 
         auto const contextId = 0;
-        TLLM_LOG_WARNING(">>>>trying to set input/output tensors for runtime");
         mRuntime->setInputTensors(contextId, inputMap);
-        TLLM_LOG_WARNING(">>>>trying to set output tensors for runtime");
         mRuntime->setOutputTensors(contextId, outputMap);
-        TLLM_LOG_WARNING(">>>>RUNNING Local transformer for token=%d", i);
         auto enqueueSuccessful = mRuntime->executeContext(contextId);
         if (!enqueueSuccessful)
         {
@@ -153,8 +179,45 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
         }
         sync_check_cuda_error(mRuntime->getStream().get());
 
+        // handle logits, but forwarding them to requests
+        HandleLogits(contextRequests, generationRequests, decoderBuffers);
+        // prepare inputs for decoder
+        std::tie(decodingInput, decodingOutput)
+            = (*mMakeDecodingBatchInputOutput)(contextRequests, generationRequests,
+                *decoderBuffers, decoderInputBuffers, decoder->getDecoderState(),
+                mModelConfig, maxNumSequences, 1, getBufferManager(),
+                mRuntime->getStream(), std::nullopt);
+        // actually execute the decoder
+        runtime::CudaEvent finishedEvent = decoder->forwardAsync(*decodingOutput, *decodingInput);
+        // update decoder buffers
+        manager.getStream().wait(finishedEvent);
+        // not sure i actually need to copy all of these for all iterations
+        manager.copy(*decoder->getDecoderState().getAllNewTokens(), *decoderBuffers->newOutputTokensHost);
+        if (i == 0) {
+            manager.copy(*decoder->getDecoderState().getJointDecodingOutput().lengths, *decoderBuffers->sequenceLengthsHost);
+            auto const finishedSumDevice = decoder->getDecoderState().getFinishedSum();
+            manager.copy(*finishedSumDevice, *decoderBuffers->finishedSumHost);
+            auto const finishReasonsDevice = decoder->getDecoderState().getFinishReasons();
+            manager.copy(*finishReasonsDevice, *decoderBuffers->finishReasonsHost);
+        }
+
+        for (auto const& requests : {contextRequests, generationRequests})
+        {
+            for (auto const& llmReq : requests)
+            {
+                auto const seqSlot = llmReq->mSeqSlots.at(0);
+                auto const hostNewOutputTokensShape = decoderBuffers->newOutputTokensHost->getShape();
+                auto const newTokenIdx = tensorrt_llm::common::flat_index(hostNewOutputTokensShape.d, 0, seqSlot, 0 /*beam*/);
+                auto const* const hostNewOutputTokensData
+                    = bufferCast<TokenIdType const>(*decoderBuffers->newOutputTokensHost);
+                auto const newToken = hostNewOutputTokensData[newTokenIdx];
+                TLLM_LOG_WARNING(">>>>>>sampled token %d for vocab %d", newToken, i);
+                llmReq->addNewToken(newToken, 0 /*beam*/);
+            }
+        }
         // copy logits to CPU and inspect
         // TODO: THIS IS TEMP TEST OUTPUTs
+        /*
         manager.copy(*outLogits, *outLogitsHost);
         {
             auto const reqNum = generationRequests.size() + contextRequests.size();
@@ -167,12 +230,10 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
                     float fv = __half2float(logitsHostPtr[b * vocabSize + v]);
                     if (fv > maxVal) { maxVal = fv; argmax = v; }
                 }
-                TLLM_LOG_WARNING(">>>>[LocalTransformer] generating token=%d batchIdx=%d argmax=%d", i, b, argmax);
             }
         }
-        // TODO: run sampling using logits, store results to inTokens buffer
+        */
     }
-    TLLM_LOG_WARNING("=======================");
 }
 
 runtime::BufferManager const& TrtLocalTransformer::getBufferManager() const

@@ -79,7 +79,6 @@ class HandleContextLogits;
 class HandleGenerationLogits;
 class GenerateRequestOptions;
 class LogitsPostProcessor;
-class MakeDecodingBatchInputOutput;
 class CreateNewDecoderRequests;
 
 namespace utils
@@ -191,11 +190,6 @@ public:
         return mModelConfig.getSpeculativeDecodingMode();
     }
 
-    void setLocalTransformer(std::shared_ptr<TrtLocalTransformer> localTransformer)
-    {
-        mLocalTransformer = std::move(localTransformer);
-    }
-
 private:
     [[nodiscard]] SizeType32 getContextBufferId() const
     {
@@ -291,8 +285,6 @@ private:
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    runtime::CudaEvent updateDecoderBuffers(
-        bool returnLogProbs, runtime::CudaEvent decoderFinishEvent, SizeType32 vocabId = 0);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -310,7 +302,7 @@ private:
     /// @param[in] scheduledRequests The requests to copy the cache indirections for.
     /// @param[in] genBufferId The id of the generation buffers for those requests.
     void copyCacheIndirectionFromOutputsToInputs(
-        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId);
+        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId);
 
     [[nodiscard]] bool getGatherGenerationLogits() const override
     {
@@ -446,7 +438,7 @@ private:
     // Runner for the TRT engine. The engine produces logits.
     std::shared_ptr<runtime::TllmRuntime> mRuntime;
     // Decoders that generates new tokens from the logits.
-    std::vector<std::shared_ptr<runtime::GptDecoderBatched>> mDecoders;
+    std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
     // optional local transformer to do auto-regressive multi-vocab sampling
@@ -521,14 +513,14 @@ private:
     // Decoder buffers for each micro batch.
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
     // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::vector<std::shared_ptr<DecoderBuffers>> mDecoderBuffers;
+    std::shared_ptr<DecoderBuffers> mDecoderBuffers;
     // Buffers for each slot in the decoder
     std::vector<std::shared_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
     // Decoder input for each micro batch.
-    std::vector<std::vector<std::unique_ptr<runtime::decoder_batch::Input>>> mDecodingInputs;
-    std::vector<std::unique_ptr<runtime::decoder_batch::Output>> mDecodingOutput;
+    std::vector<std::unique_ptr<runtime::decoder_batch::Input>> mDecodingInputs;
+    std::unique_ptr<runtime::decoder_batch::Output> mDecodingOutput;
 
     /******************** Book keeping ********************/
     // List of requests in each micro batch
@@ -572,7 +564,6 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::HandleGenerationLogits const> mHandleGenerationLogits;
     std::unique_ptr<tensorrt_llm::batch_manager::GenerateRequestOptions const> mGenerateRequestOptions;
     std::unique_ptr<tensorrt_llm::batch_manager::LogitsPostProcessor const> mLogitsPostProcessor;
-    std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
     std::unique_ptr<tensorrt_llm::batch_manager::CreateNewDecoderRequests const> mCreateNewDecoderRequests;
 
 };

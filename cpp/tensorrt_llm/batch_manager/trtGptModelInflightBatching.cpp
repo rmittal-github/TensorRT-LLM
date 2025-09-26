@@ -149,28 +149,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     TLLM_LOG_INFO("gatherContextLogits: %d", mModelConfig.computeContextLogits());
     TLLM_LOG_INFO("gatherGenerationLogits: %d", getGatherGenerationLogits());
 
-    // create local transformer
-    try
-    {
-        auto const placeholderEnginePath = std::filesystem::path("/code/tensorrt_llm/local_transformer.trt");
-        if (std::filesystem::exists(placeholderEnginePath))
-        {
-            auto localRawEngine = runtime::RawEngine(placeholderEnginePath);
-            mLocalTransformer = std::make_shared<batch_manager::TrtLocalTransformer>(
-                modelConfig, worldConfig, localRawEngine, std::make_shared<runtime::TllmLogger>());
-        }
-        else
-        {
-            TLLM_LOG_WARNING(
-                "TrtLocalTransformer engine not found at placeholder path. Replace with actual engine path.");
-        }
-    }
-    catch (std::exception const&)
-    {
-        // Non-fatal: proceed without local transformer
-        TLLM_LOG_WARNING("Failed to initialize TrtLocalTransformer. Decoding continues without it.");
-    }
-
     // run local transformer to test if it runs correctly
     if (!(mModelConfig.supportsInflightBatching()))
     {
@@ -193,6 +171,30 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mNumBuffers = (mCtxGenFusion ? 1 : 2) * mNumMicroBatches;
+
+    // create local transformer
+    try
+    {
+        auto const placeholderEnginePath = std::filesystem::path("/code/tensorrt_llm/local_transformer.trt");
+        if (std::filesystem::exists(placeholderEnginePath))
+        {
+            auto localRawEngine = runtime::RawEngine(placeholderEnginePath);
+            mLocalTransformer = std::make_shared<batch_manager::TrtLocalTransformer>(
+                modelConfig, worldConfig, localRawEngine, std::make_shared<runtime::TllmLogger>(),
+                getMaxNumSequences(), getMaxSequenceLen(), mNumMicroBatches, getMaxBatchSize()
+            );
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "TrtLocalTransformer engine not found at placeholder path. Replace with actual engine path.");
+        }
+    }
+    catch (std::exception const&)
+    {
+        // Non-fatal: proceed without local transformer
+        TLLM_LOG_WARNING("Failed to initialize TrtLocalTransformer. Decoding continues without it.");
+    }
 
     if (!optionalParams.kvCacheConfig.onboardBlocks)
     {
@@ -254,7 +256,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     TLLM_LOG_INFO("[MemUsageChange] Allocated %s GPU memory for runtime buffers.",
         memCounter.bytesToString(gpuUsage2 - gpuUsage1).c_str());
 
-    createDecoder(mDecodingConfig.getDecodingMode());
     auto const gpuUsage3 = memCounter.getGpu();
     TLLM_LOG_INFO("[MemUsageChange] Allocated %s GPU memory for decoder.",
         memCounter.bytesToString(gpuUsage3 - gpuUsage2).c_str());
@@ -968,7 +969,8 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
                 setupDecoderStep(currRequests.contextRequests, *mBuffers.at(contextBufferId),
-                    mDecoderInputBuffers.at(getFusedBufferId()));
+                    mLocalTransformer->getDecoder(),
+                    mLocalTransformer->getDecoderInputBuffers(getFusedBufferId()));
             }
             else
             {
@@ -1000,7 +1002,8 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
                 setupDecoderStep(currRequests.contextRequests, *mBuffers.at(contextBufferId),
-                    mDecoderInputBuffers.at(getFusedBufferId()));
+                    mLocalTransformer->getDecoder(),
+                    mLocalTransformer->getDecoderInputBuffers(getFusedBufferId()));
             }
 
             sync_check_cuda_error(mRuntime->getStream().get());
@@ -1252,137 +1255,6 @@ void TrtGptModelInflightBatching::createRuntimeContexts()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-namespace
-{
-// TODO: move this somewhere else?
-executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
-    std::optional<executor::DecodingMode> const& decodingModeOpt, runtime::SizeType32 const beamWidth)
-{
-    auto getDefaultDecodingMode = [beamWidth](std::optional<executor::DecodingMode> const& decodingModeOpt)
-    {
-        if (decodingModeOpt.has_value() && !decodingModeOpt->isAuto())
-        {
-            return decodingModeOpt.value();
-        }
-        if (beamWidth == 1)
-        {
-            return executor::DecodingMode::TopKTopP();
-        }
-        return executor::DecodingMode::BeamSearch();
-    };
-
-    auto decodingMode = getDefaultDecodingMode(decodingModeOpt);
-    // Overwrite decoding mode when beam width is one.
-    if (beamWidth == 1 && decodingMode.isBeamSearch())
-    {
-        TLLM_LOG_WARNING(
-            "Beam width is set to 1, but decoding mode is BeamSearch. Overwriting decoding mode to TopKTopP.");
-        decodingMode = executor::DecodingMode::TopKTopP();
-    }
-    // Overwrite decoding mode when Medusa is used.
-    if (specDecodingMode.isMedusa() && !decodingMode.isMedusa())
-    {
-        TLLM_LOG_WARNING("Model is Medusa, but decoding mode is not Medusa. Overwriting decoding mode to Medusa.");
-        decodingMode = executor::DecodingMode::Medusa();
-    }
-    // Overwrite decoding mode when Medusa is not used.
-    if (!specDecodingMode.isMedusa() && decodingMode.isMedusa())
-    {
-        TLLM_LOG_WARNING("Model is not Medusa, but decoding mode is Medusa. Overwriting decoding mode.");
-        decodingMode = getDefaultDecodingMode(decodingModeOpt);
-    }
-    // Overwrite decoding mode when lookahead decoding is used.
-    if (specDecodingMode.isLookaheadDecoding() && !decodingMode.isLookahead())
-    {
-        TLLM_LOG_WARNING(
-            "Model is Lookahead, but decoding mode is not Lookahead. Overwriting decoding mode to Lookahead.");
-        decodingMode = executor::DecodingMode::Lookahead();
-    }
-    // Overwrite decoding mode when lookahead decoding is not used.
-    if (!specDecodingMode.isLookaheadDecoding() && decodingMode.isLookahead())
-    {
-        TLLM_LOG_WARNING(
-            "Model is not built with Lookahead decoding, but decoding mode is Lookahead. Overwriting decoding "
-            "mode.");
-        decodingMode = getDefaultDecodingMode(decodingModeOpt);
-    }
-    // Overwrite decoding mode when 'explicit draft tokens' is used.
-    if (specDecodingMode.isExplicitDraftTokens() && !decodingMode.isExplicitDraftTokens())
-    {
-        TLLM_LOG_WARNING(
-            "Model is built with 'explicit draft tokens' decoding, but decoding mode is something else. Overwriting "
-            "decoding mode.");
-        decodingMode = executor::DecodingMode::ExplicitDraftTokens();
-    }
-    // Overwrite decoding mode when 'explicit draft tokens' is not used.
-    if (!specDecodingMode.isExplicitDraftTokens() && decodingMode.isExplicitDraftTokens())
-    {
-        TLLM_LOG_WARNING(
-            "Model is not built with 'explicit draft tokens' decoding, but decoding mode is set to it. Overwriting "
-            "decoding "
-            "mode to default.");
-        decodingMode = getDefaultDecodingMode(decodingModeOpt);
-    }
-    // Overwrite decoding mode when EAGLE is used.
-    if (specDecodingMode.isEagle() && !decodingMode.isEagle())
-    {
-        TLLM_LOG_WARNING("Model is Eagle, but decoding mode is not Eagle. Overwriting decoding mode to Eagle.");
-        decodingMode = executor::DecodingMode::Eagle();
-    }
-    // Overwrite decoding mode when Eagle is not used.
-    if (!specDecodingMode.isEagle() && decodingMode.isEagle())
-    {
-        TLLM_LOG_WARNING("Model is not Eagle, but decoding mode is Eagle. Overwriting decoding mode.");
-        decodingMode = getDefaultDecodingMode(decodingModeOpt);
-    }
-    if (specDecodingMode.isDraftTokensExternal())
-    {
-        TLLM_LOG_WARNING("Overwriting decoding mode to external draft token");
-        decodingMode = executor::DecodingMode::ExternalDraftTokens();
-    }
-    return decodingMode;
-}
-} // namespace
-
-void TrtGptModelInflightBatching::createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    if (mWorldConfig.isLastPipelineParallelRank())
-    {
-        auto decoderType = mRuntime->getEngine().getTensorDataType("logits");
-
-        auto const decodingMode
-            = getDecodingMode(mModelConfig.getSpeculativeDecodingMode(), decodingModeOpt, mOperatingBeamWidth);
-        if (decodingMode.isExplicitDraftTokens())
-        {
-            // There are no logits in Explicit draft tokens model.
-            decoderType = mModelConfig.getDataType();
-            // Decoder is not instantiated for bf16. We use half to get the same data size
-            // and explicitly pass dtype to redrafter that has bf16 kernels.
-            if (decoderType == nvinfer1::DataType::kBF16)
-            {
-                decoderType = nvinfer1::DataType::kHALF;
-            }
-        }
-
-        mDecoder = std::make_shared<runtime::GptDecoderBatched>(
-            mLocalTransformer->getRuntimeStreamPtr(),
-            mModelConfig.getSpeculativeDecodingMode(),
-            decoderType
-        );
-        mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(),
-            getSinkTokenLen(), getMaxSequenceLen(), mModelConfig.getMaxDecodingTokens(),
-            decoderType, mModelConfig, mWorldConfig
-        );
-        TLLM_CHECK_WITH_INFO(!decodingMode.isExplicitDraftTokens(), "explicit draft tokens not supported for local transformer");
-        TLLM_CHECK_WITH_INFO(!decodingMode.isLookahead(), "lookahead not supported for local transformer");
-        TLLM_CHECK_WITH_INFO(!decodingMode.isEagle(), "eagle not supported for local transformer");
-    }
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
 void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& decodingConfig,
     std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs)
 {
@@ -1395,29 +1267,6 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
             getMaxAttentionWindowVec(), getMaxAttentionWindow(), getSinkTokenLen(), *mRuntime, mModelConfig,
             mWorldConfig, decodingConfig, getGatherGenerationLogits(), getMaxNumTokens(), additionalModelOutputs));
     }
-
-    for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
-    {
-        mDecoderInputBuffers.emplace_back(
-            getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mLocalTransformer->getBufferManager());
-    }
-
-    mDecoderBuffers = std::make_shared<DecoderBuffers>(
-        getMaxNumSequences(), mOperatingBeamWidth,
-        getMaxAttentionWindow(), getMaxSequenceLen(),
-        mModelConfig.getMaxDecodingTokens(), mLocalTransformer->getBufferManager(),
-        mModelConfig, mWorldConfig
-    );
-
-    mSlotDecoderBuffers.clear();
-    for (SizeType32 i = 0; i < getMaxNumSequences(); ++i)
-    {
-        mSlotDecoderBuffers.emplace_back(std::make_shared<SlotDecoderBuffers>(
-            mOperatingBeamWidth, getMaxSequenceLen(), mLocalTransformer->getBufferManager()));
-    }
-
-    mDecodingInputs.resize(mNumMicroBatches);
-
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -1523,11 +1372,13 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto const bufferId = getFusedBufferId();
         auto& runtimeBuffers = *mBuffers[bufferId];
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
+            *mLocalTransformer->getDecoderBuffers(0), mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits());
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
         setupDecoderStep(
-            cacheTransCompleteRequests, *mBuffers.at(contextBufferId), mDecoderInputBuffers.at(getFusedBufferId()));
+            cacheTransCompleteRequests, *mBuffers.at(contextBufferId),
+            mLocalTransformer->getDecoder(),
+            mLocalTransformer->getDecoderInputBuffers(getFusedBufferId()));
         sync_check_cuda_error(mRuntime->getStream().get());
         auto timeEnd = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
@@ -1582,9 +1433,11 @@ TrtGptModelInflightBatching::prepareBuffers(
 
     auto& runtimeBuffers = *mBuffers[bufferId];
 
+    // used for fill sequenceLength tensor, could use any vocab's buffer
+    auto& decoderBuffer = *(mLocalTransformer->getDecoderBuffers(0));
     auto [optProfileId, inputMap, outputMap]
         = runtimeBuffers.prepareStep(contextRequests, generationRequests, mOperatingBeamWidth, getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
+            decoderBuffer, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[bufferId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits());
 
     mRuntime->setInputTensors(optProfileId, inputMap);
@@ -1685,7 +1538,9 @@ void TrtGptModelInflightBatching::executeStep(
 }
 
 void TrtGptModelInflightBatching::setupDecoderStep(
-    RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers const& inputBuffers)
+    RequestVector const& contextRequests, RuntimeBuffers const& buffers,
+    std::shared_ptr<runtime::GptDecoderBatched> decoder,
+    DecoderInputBuffers const& inputBuffers)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(setupDecoderStep);
@@ -1716,14 +1571,14 @@ void TrtGptModelInflightBatching::setupDecoderStep(
         );
         if (!decoderRequests.empty())
         {
-            (*mCreateNewDecoderRequests)(batchSlots, decoderRequests, samplingConfigs, mModelConfig, *mDecoder,
-                mRuntime->getStream(), getMaxSequenceLen());
+            (*mCreateNewDecoderRequests)(batchSlots, decoderRequests, samplingConfigs, mModelConfig, *decoder,
+                mLocalTransformer->getRuntimeStream(), getMaxSequenceLen());
             auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
-            mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
-                {mDecoder->getDecoderState().getJointDecodingOutput()}, {decoderRequests});
+            decoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
+                {decoder->getDecoderState().getJointDecodingOutput()}, {decoderRequests});
 
-            auto const& stream = mDecoder->getDecoderStream();
+            auto const& stream = decoder->getDecoderStream();
             CudaEvent event{};
             stream->record(event);
             mRuntime->getStreamPtr()->wait(event);
@@ -1793,13 +1648,14 @@ void TrtGptModelInflightBatching::postProcessRequest(
     // Update mDecoderBuffers->slotOutputIdsHost and synchronize
     getDecoderSlotHostOutputs(seqSlot, llmReq.returnLogProbs(), llmReq.mSamplingConfig, llmReq.isStreaming());
 
-    auto const* outputIdsHostData = bufferCast<TokenIdType>(*mSlotDecoderBuffers[seqSlot]->outputIdsHost);
-    auto const* sequenceLengthsHostData = bufferCast<SizeType32>(*mSlotDecoderBuffers[seqSlot]->sequenceLengthsHost);
-    auto const* cumLogProbsHostData = bufferCast<float>(*mSlotDecoderBuffers[seqSlot]->cumLogProbsHost);
-    auto logProbsHost = mSlotDecoderBuffers[seqSlot]->logProbsHost;
+    auto& slotDecoderBuffers = mLocalTransformer->getSlotDecoderBuffers(seqSlot);
+    auto const* outputIdsHostData = bufferCast<TokenIdType>(*slotDecoderBuffers->outputIdsHost);
+    auto const* sequenceLengthsHostData = bufferCast<SizeType32>(*slotDecoderBuffers->sequenceLengthsHost);
+    auto const* cumLogProbsHostData = bufferCast<float>(*slotDecoderBuffers->cumLogProbsHost);
+    auto logProbsHost = slotDecoderBuffers->logProbsHost;
     auto const* logProbsHostData = bufferCast<float>(*logProbsHost);
 
-    auto const& outputIdsShape = mSlotDecoderBuffers[seqSlot]->outputIdsHost->getShape();
+    auto const& outputIdsShape = slotDecoderBuffers->outputIdsHost->getShape();
     auto const maxSeqLength = outputIdsShape.d[1];
 
     std::vector<std::vector<TokenIdType>> generatedTokens(reqBeamWidth);
@@ -1832,24 +1688,27 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
     SizeType32 seqSlot, bool returnLogProbs, SamplingConfig const& samplingConfig, bool streaming)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto &manager = mLocalTransformer->getBufferManager();
+    auto &slotDecoderBuffers = mLocalTransformer->getSlotDecoderBuffers(seqSlot);
     if (mWorldConfig.isLastPipelineParallelRank())
     {
-        auto event = mDecoder->finalize(mDecoder->getDecoderState(), seqSlot, samplingConfig, streaming);
+        auto& decoder = mLocalTransformer->getDecoder();
+        auto event = decoder->finalize(decoder->getDecoderState(), seqSlot, samplingConfig, streaming);
         // Make sure that postprocessing is done before copying outputIds
-        mCopyBufferManager.getStream().wait(event.get());
+        manager.getStream().wait(event.get());
 
         TensorPtr sequenceLengthView
-            = ITensor::slice(mDecoder->getDecoderState().getJointDecodingOutput().lengths, seqSlot, 1);
-        auto outputIds = mDecoder->getDecoderState().getGatheredIds(seqSlot);
-        auto cumLogProbs = mDecoder->getDecoderState().getCumLogProbs(seqSlot);
-        auto logProbs = mDecoder->getDecoderState().getLogProbs(seqSlot);
+            = ITensor::slice(decoder->getDecoderState().getJointDecodingOutput().lengths, seqSlot, 1);
+        auto outputIds = decoder->getDecoderState().getGatheredIds(seqSlot);
+        auto cumLogProbs = decoder->getDecoderState().getCumLogProbs(seqSlot);
+        auto logProbs = decoder->getDecoderState().getLogProbs(seqSlot);
 
-        mCopyBufferManager.copy(*sequenceLengthView, *mSlotDecoderBuffers[seqSlot]->sequenceLengths);
-        mCopyBufferManager.copy(*outputIds, *mSlotDecoderBuffers[seqSlot]->outputIds);
+        manager.copy(*sequenceLengthView, *slotDecoderBuffers->sequenceLengths);
+        manager.copy(*outputIds, *slotDecoderBuffers->outputIds);
         if (returnLogProbs)
         {
-            mCopyBufferManager.copy(*cumLogProbs, *mSlotDecoderBuffers[seqSlot]->cumLogProbs);
-            mCopyBufferManager.copy(*logProbs, *mSlotDecoderBuffers[seqSlot]->logProbs);
+            manager.copy(*cumLogProbs, *slotDecoderBuffers->cumLogProbs);
+            manager.copy(*logProbs, *slotDecoderBuffers->logProbs);
         }
 
         if (mWorldConfig.isPipelineParallel())
@@ -1866,35 +1725,35 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
     {
         auto const peerRecv = mWorldConfig.getPipelineParallelRank() == 0 ? mWorldConfig.getPipelineParallelism() - 1
                                                                           : mWorldConfig.getPipelineParallelRank() - 1;
-        mSlotDecoderBuffers[seqSlot]->recv(mMpiCommPipelinePara, returnLogProbs, peerRecv);
+        slotDecoderBuffers->recv(mMpiCommPipelinePara, returnLogProbs, peerRecv);
 
         auto const peerSend = mWorldConfig.getPipelineParallelRank() + 1;
         if (peerSend != mWorldConfig.getPipelineParallelism() - 1)
         {
             mDecSlotAsyncSndHdls.emplace_back(
-                mSlotDecoderBuffers[seqSlot]->asyncSend(mMpiCommPipelinePara, returnLogProbs, peerSend));
+                slotDecoderBuffers->asyncSend(mMpiCommPipelinePara, returnLogProbs, peerSend));
         }
     }
-    sync_check_cuda_error(mRuntime->getStream().get());
+    sync_check_cuda_error(mLocalTransformer->getRuntimeStream().get());
 
     // Here copy stream is synchronized after receiving decoderSlotOutputIdsView either by copy or by receive
     // before copying to host on copy stream
     runtime::CudaEvent beforeEvent{};
     mRuntime->getStreamPtr()->record(beforeEvent);
-    mCopyBufferManager.getStream().wait(beforeEvent);
-    mCopyBufferManager.copy(*mSlotDecoderBuffers[seqSlot]->outputIds, *mSlotDecoderBuffers[seqSlot]->outputIdsHost);
-    mCopyBufferManager.copy(
-        *mSlotDecoderBuffers[seqSlot]->sequenceLengths, *mSlotDecoderBuffers[seqSlot]->sequenceLengthsHost);
+    manager.getStream().wait(beforeEvent);
+    manager.copy(*slotDecoderBuffers->outputIds, *slotDecoderBuffers->outputIdsHost);
+    manager.copy(
+        *slotDecoderBuffers->sequenceLengths, *slotDecoderBuffers->sequenceLengthsHost);
 
     if (returnLogProbs)
     {
-        mCopyBufferManager.copy(
-            *mSlotDecoderBuffers[seqSlot]->cumLogProbs, *mSlotDecoderBuffers[seqSlot]->cumLogProbsHost);
-        mCopyBufferManager.copy(*mSlotDecoderBuffers[seqSlot]->logProbs, *mSlotDecoderBuffers[seqSlot]->logProbsHost);
+        manager.copy(
+            *slotDecoderBuffers->cumLogProbs, *slotDecoderBuffers->cumLogProbsHost);
+        manager.copy(*slotDecoderBuffers->logProbs, *slotDecoderBuffers->logProbsHost);
     }
 
     // Make sure copy is done before continuing on host
-    mCopyBufferManager.getStream().synchronize();
+    manager.getStream().synchronize();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -1920,7 +1779,9 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     TLLM_CHECK_WITH_INFO(!mGuidedDecoder, "guided decoder not supported for local transformer");
     auto const buffId = getFusedBufferId();
     // copy indirection before anything else
-    copyCacheIndirectionFromOutputsToInputs(scheduledRequests, buffId);
+    for (SizeType32 vocabId = 0; vocabId < getNumVocabs(); vocabId++) {
+        copyCacheIndirectionFromOutputsToInputs(scheduledRequests, buffId, vocabId);
+    }
 
     // run local transformer
     auto& buf = mBuffers.at(buffId);
@@ -1929,13 +1790,8 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
         scheduledRequests.contextRequests,
         buf->numContextLogits,
         scheduledRequests.generationRequests,
-        // sampling staff
-        mDecoder,
-        mDecodingInputs.at(mMicroBatchId),
-        mDecodingOutput,
-        mDecoderInputBuffers.at(buffId),
-        mDecoderBuffers,
-        getMaxNumSequences()
+        mMicroBatchId,
+        buffId
     );
 
     CudaEvent event{};
@@ -1945,7 +1801,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
 }
 
 void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
-    ScheduledRequests const& scheduledRequests, SizeType32 genBufferId)
+    ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(copyCacheIndirectionFromOutputsToInputs);
@@ -1955,7 +1811,8 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
     auto* dstOffsetsPtr = bufferCast<SizeType64>(*genRuntimeBuffers.cacheIndirDecoderIOBatchedCopyDstOffsets);
     auto* copySizesPtr = bufferCast<SizeType64>(*genRuntimeBuffers.cacheIndirDecoderIOBatchedCopySizes);
 
-    auto const& cacheIndirShape = mDecoderBuffers->cacheIndirectionOutput->getShape();
+    auto& decoderBuffers = mLocalTransformer->getDecoderBuffers(vocabId);
+    auto const& cacheIndirShape = decoderBuffers->cacheIndirectionOutput->getShape();
 
     SizeType32 batchIdx{0};
     SizeType64 maxCopySize{0};
@@ -1994,8 +1851,8 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
         auto const copySizesDeviceSlice
             = ITensor::slice(genRuntimeBuffers.mCacheIndirDecoderIOBatchedCopyCopySizesDevice, 0, batchIdx);
         manager.copy(sizesSlice->data(), *copySizesDeviceSlice); // Explicitly move to device for faster access.
-        runtime::kernels::invokeCopyBatch(*mDecoderBuffers->cacheIndirectionOutput,
-            *mDecoderBuffers->cacheIndirectionInput, *srcOffsetsSliceDeviceSlice, *dstOffsetsSliceDeviceSlice,
+        runtime::kernels::invokeCopyBatch(*decoderBuffers->cacheIndirectionOutput,
+            *decoderBuffers->cacheIndirectionInput, *srcOffsetsSliceDeviceSlice, *dstOffsetsSliceDeviceSlice,
             *copySizesDeviceSlice, maxCopySize, manager.getStream());
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -2008,33 +1865,36 @@ std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::
     NVTX3_SCOPED_RANGE(communicateDecoderBuffers);
 
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> asyncHandles;
-    if (mWorldConfig.isLastPipelineParallelRank())
-    {
-        if (broadcastPostDecoder())
+    for (SizeType32 vocabId = 0; vocabId < getNumVocabs(); vocabId++) {
+        auto& decoderBuffers = mLocalTransformer->getDecoderBuffers(vocabId);
+        if (mWorldConfig.isLastPipelineParallelRank())
         {
-            mDecoderBuffers->bcast(mMpiCommTensorPara, returnLogProbs, mOperatingBeamWidth,
-                mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), 0);
-        }
+            if (broadcastPostDecoder())
+            {
+                decoderBuffers->bcast(mMpiCommTensorPara, returnLogProbs, mOperatingBeamWidth,
+                    mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), 0);
+            }
 
-        if (mWorldConfig.isPipelineParallel())
-        {
-            auto const peerSend = 0;
-            asyncHandles.emplace_back(mDecoderBuffers->asyncSend(mMpiCommPipelinePara, returnLogProbs,
-                mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), peerSend));
+            if (mWorldConfig.isPipelineParallel())
+            {
+                auto const peerSend = 0;
+                asyncHandles.emplace_back(decoderBuffers->asyncSend(mMpiCommPipelinePara, returnLogProbs,
+                    mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), peerSend));
+            }
         }
-    }
-    else
-    {
-        auto const peerRecv = mWorldConfig.isFirstPipelineParallelRank()
-            ? mWorldConfig.getPipelineParallelism() - 1
-            : mWorldConfig.getPipelineParallelRank() - 1;
-            mDecoderBuffers->recv(mMpiCommPipelinePara, returnLogProbs, mOperatingBeamWidth,
-            mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), peerRecv);
-        auto const peerSend = mWorldConfig.getPipelineParallelRank() + 1;
-        if (peerSend != mWorldConfig.getPipelineParallelism() - 1)
+        else
         {
-            asyncHandles.emplace_back(mDecoderBuffers->asyncSend(mMpiCommPipelinePara, returnLogProbs,
-                mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), peerSend));
+            auto const peerRecv = mWorldConfig.isFirstPipelineParallelRank()
+                ? mWorldConfig.getPipelineParallelism() - 1
+                : mWorldConfig.getPipelineParallelRank() - 1;
+                decoderBuffers->recv(mMpiCommPipelinePara, returnLogProbs, mOperatingBeamWidth,
+                mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), peerRecv);
+            auto const peerSend = mWorldConfig.getPipelineParallelRank() + 1;
+            if (peerSend != mWorldConfig.getPipelineParallelism() - 1)
+            {
+                asyncHandles.emplace_back(decoderBuffers->asyncSend(mMpiCommPipelinePara, returnLogProbs,
+                    mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), peerSend));
+            }
         }
     }
 
@@ -2050,19 +1910,21 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(updateRequests);
 
+    // doest matter for this purpose
+    auto &firstDecoderBuffers = mLocalTransformer->getDecoderBuffers(0);
     auto const* const sequenceLengthsHostData
-        = bufferCast<SizeType32 const>(*mDecoderBuffers->sequenceLengthsHost);
-    auto const* const decoderFinishedSumPtr = bufferCast<SizeType32 const>(*mDecoderBuffers->finishedSumHost);
+        = bufferCast<SizeType32 const>(*firstDecoderBuffers->sequenceLengthsHost);
+    auto const* const decoderFinishedSumPtr = bufferCast<SizeType32 const>(*firstDecoderBuffers->finishedSumHost);
     auto const* const nextDraftTokensHostData = mModelConfig.getSpeculativeDecodingMode().predictsDraftTokens()
-        ? bufferCast<TokenIdType const>(*mDecoderBuffers->draftBuffers.nextDraftTokensHost)
+        ? bufferCast<TokenIdType const>(*firstDecoderBuffers->draftBuffers.nextDraftTokensHost)
         : nullptr;
     auto const* const nextDraftTokensLengthsHostData = mModelConfig.getSpeculativeDecodingMode().predictsDraftTokens()
             && mModelConfig.getSpeculativeDecodingMode().variableDraftLength()
-        ? bufferCast<SizeType32 const>(*mDecoderBuffers->draftBuffers.nextDraftTokensLengthsHost)
+        ? bufferCast<SizeType32 const>(*firstDecoderBuffers->draftBuffers.nextDraftTokensLengthsHost)
         : nullptr;
     // use first vocab finished reasons
     auto const* const finishReasonsHostData
-        = bufferCast<kernels::FinishedState>(*mDecoderBuffers->finishReasonsHost);
+        = bufferCast<kernels::FinishedState>(*firstDecoderBuffers->finishReasonsHost);
 
     // Update the request table tokens
     // instead of copy-pasting the loop for context and generation requests,
@@ -2106,19 +1968,38 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                 // to llmReq if decoder seq length is greater than current number of tokens
                 numNewTokens[beam] = std::min(numGeneratedTokens, seqLen - llmReq->getNumTokens(beam));
                 numDroppedTokens[beam] = numGeneratedTokens - numNewTokens[beam];
-                /*
+
                 for (SizeType32 step = 0; step < numNewTokens[beam]; ++step)
                 {
-                    auto const hostNewOutputTokensShape = mDecoderBuffers->newOutputTokensHost->getShape();
-                    auto const newTokenIdx = tc::flat_index(hostNewOutputTokensShape.d, step, seqSlot, beam);
-                    auto const* const hostNewOutputTokensData
-                        = bufferCast<TokenIdType const>(*mDecoderBuffers->newOutputTokensHost);
-                    auto const newToken = hostNewOutputTokensData[newTokenIdx];
-                    // TODO add offset for vocab!!!
-                    llmReq->addNewToken(newToken, beam);
-                    TLLM_LOG_DEBUG("request ID %ld beam %d newToken %d", llmReq->mRequestId, beam, newToken);
+                    SizeType32 vocabOffset = 0;
+                    for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
+                    {
+                        auto& decoderBuffers = mLocalTransformer->getDecoderBuffers(vid);
+                        auto const hostNewOutputTokensShape = decoderBuffers->newOutputTokensHost->getShape();
+                        auto const newTokenIdx = tc::flat_index(hostNewOutputTokensShape.d, step, seqSlot, beam);
+                        auto const* const hostNewOutputTokensData
+                            = bufferCast<TokenIdType const>(*decoderBuffers->newOutputTokensHost);
+                        auto const newToken = hostNewOutputTokensData[newTokenIdx];
+                        llmReq->addNewToken(newToken + vocabOffset, beam);
+                        if (llmReq->returnLogProbs())
+                        {
+                            auto const* const cumLogProbsPtr
+                                = bufferCast<float const>(*decoderBuffers->cumLogProbsHost);
+                            auto const cumLogProb = cumLogProbsPtr[seqSlot * mOperatingBeamWidth + beam];
+                            llmReq->setCumLogProb(cumLogProb, beam);
+
+                            auto const beginLogProbsOffset = reqBeamWidth == 1 ? llmReq->mPromptLen : 0;
+                            SizeType32 offset
+                                = (seqSlot * mOperatingBeamWidth + beam) * getMaxSequenceLen() + beginLogProbsOffset;
+                            auto const generatedLength = seqLen - llmReq->mPromptLen;
+                            auto const* const logProbsPtr
+                                = bufferCast<float const>(*decoderBuffers->logProbsHost);
+                            std::vector<float> logProbs(logProbsPtr + offset, logProbsPtr + offset + generatedLength);
+                            llmReq->setLogProbs(logProbs, beam);
+                        }
+                        vocabOffset += mModelConfig.getVocabSizes()[vid];
+                    }
                 }
-                */
 
                 auto const finishReason = finishReasonsHostData[seqSlot * mOperatingBeamWidth + beam];
                 llmReq->setFinishedReason(finishReason.toFinishReason(), beam);
@@ -2308,15 +2189,16 @@ void TrtGptModelInflightBatching::rewindKVCacheBlocks(SizeType32 numSequences)
 
     auto commonRewindLen = mModelConfig.getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
     SizeType32 const* rewindLens = nullptr;
+    auto& decoderBuffers = mLocalTransformer->getDecoderBuffers(0);
     if (mModelConfig.getSpeculativeDecodingMode().variableDraftLength())
     {
         commonRewindLen = 0;
-        rewindLens = bufferCast<SizeType32 const>(*mDecoderBuffers->draftBuffers.prevDraftTokensLengthsHost);
+        rewindLens = bufferCast<SizeType32 const>(*decoderBuffers->draftBuffers.prevDraftTokensLengthsHost);
     }
 
     tensorrt_llm::runtime::kernels::invokeUpdateKVBlockArrayDraftTokenLocation(
-        *mDecoderBuffers->draftBuffers.acceptedLengthsCumSumDevice,
-        *mDecoderBuffers->draftBuffers.acceptedPackedPathsDevice, *runtimeBuffers.sequenceLengthsDevice, pointerArrayPtr,
+        *decoderBuffers->draftBuffers.acceptedLengthsCumSumDevice,
+        *decoderBuffers->draftBuffers.acceptedPackedPathsDevice, *runtimeBuffers.sequenceLengthsDevice, pointerArrayPtr,
         offsetArrayPtr, localNbLayers, numSequences, numKvHeads, sizeInBytesPerKVHead, commonRewindLen, rewindLens,
         *runtimeBuffers.seqSlotRemappingDevice, *runtimeBuffers.sortedSeqSlots, getMaxAttentionWindow(),
         maxBlocksPerSeq, tokensPerBlock, useOneMoreBlock, mRuntime->getStreamPtr()->get());
@@ -2343,7 +2225,6 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     mOperatingBeamWidth = beamWidth;
 
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
-    createDecoder(mDecodingConfig.getDecodingMode());
 
     if (static_cast<bool>(mKvCacheManager))
     {
@@ -2436,8 +2317,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         setupSpeculativeDecodingModule(mDecodingConfig);
         mBuffers.at(bufferId)->lookaheadBuffers->enableLookaheadDecoding(
             getMaxBatchSize(), mModelConfig.getMaxDecodingTokens());
-        mDecoderBuffers->enableLookaheadDecoding(getMaxNumSequences(), mModelConfig.getMaxDecodingTokens());
-        createDecoder(mDecodingConfig.getDecodingMode());
+        mLocalTransformer->getDecoderBuffers(0)->enableLookaheadDecoding(getMaxNumSequences(), mModelConfig.getMaxDecodingTokens());
     }
     else if (mModelConfig.getSpeculativeDecodingMode().isLookaheadDecoding()
         && (!canUseLookahead || numRequests > maxNumRequestForLad))
@@ -2446,9 +2326,9 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mModelConfig.disableSeamlessLookaheadDecoding();
         mDecodingConfig.setDecodingMode(executor::DecodingMode::Auto());
         mBuffers.at(bufferId)->lookaheadBuffers->disableLookaheadDecoding();
-        mDecoderBuffers->disableLookaheadDecoding(getMaxNumSequences());
-        mDecoder->disableLookahead(
-            scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);
+        mLocalTransformer->getDecoderBuffers(0)->disableLookaheadDecoding(getMaxNumSequences());
+        mLocalTransformer->getDecoder()->disableLookahead(
+            scheduledRequests.generationRequests, mLocalTransformer->getDecoderInputBuffers(getFusedBufferId()).setupBatchSlots);
         for (auto const& llmReq : scheduledRequests.generationRequests)
         {
             if (llmReq->getNumDraftTokens() > 0)

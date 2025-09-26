@@ -37,7 +37,11 @@ using namespace tensorrt_llm::runtime;
 TrtLocalTransformer::TrtLocalTransformer(
     runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, runtime::RawEngine const& rawEngine,
-    std::shared_ptr<nvinfer1::ILogger> logger)
+    std::shared_ptr<nvinfer1::ILogger> logger,
+    SizeType32 maxNumSequences,
+    SizeType32 maxSequenceLen,
+    SizeType32 numMicroBatches,
+    SizeType32 maxBatchSize)
     : mModelConfig{modelConfig}
     , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}
@@ -45,6 +49,7 @@ TrtLocalTransformer::TrtLocalTransformer(
     , hiddenSize{16192}  // TODO: change to 768 once switch to use hidden state instead of logits from model
     , numTokens{8}
     , vocabSize{2024}
+    , mMaxNumSequences{maxNumSequences}
 {
     // create a context for the local transformer engine
     mRuntime->clearContexts();
@@ -54,9 +59,43 @@ TrtLocalTransformer::TrtLocalTransformer(
     auto const statesType = mRuntime->getEngine().getTensorDataType(kInHiddenStatesTensorName);
     inHiddenStates = manager.emptyTensor(MemoryType::kGPU, statesType);
     inTokens = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    inTokensSliceHost = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
     auto const logitsType = mRuntime->getEngine().getTensorDataType(kOutLogitsTensorName);
     outLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
     outLogitsHost = manager.emptyTensor(MemoryType::kCPU, logitsType);
+
+    // create decoder and buffers
+    mDecoder = std::make_shared<runtime::GptDecoderBatched>(
+        getRuntimeStreamPtr(),
+        mModelConfig.getSpeculativeDecodingMode(),
+        logitsType
+    );
+    auto decodingMode = executor::DecodingMode::TopKTopP();
+    mDecoder->setup(decodingMode, mMaxNumSequences, 1 /*beam width*/, 0 /*attn window*/,
+        0 /*sink token len*/, maxSequenceLen, mModelConfig.getMaxDecodingTokens(),
+        logitsType, mModelConfig, mWorldConfig
+    );
+    for (SizeType32 i = 0; i < numMicroBatches; ++i)
+    {
+        mDecoderInputBuffers.emplace_back(
+            maxBatchSize, mModelConfig.getMaxDecodingTokens(), getBufferManager());
+    }
+    for (SizeType32 i = 0; i < numTokens; i++) {
+        // independent decoder buffer for each token
+        mDecoderBuffers.push_back(std::make_shared<DecoderBuffers>(
+            mMaxNumSequences, 1 /*beam width*/,
+            0 /*attn window*/, maxSequenceLen,
+            mModelConfig.getMaxDecodingTokens(), getBufferManager(),
+            mModelConfig, mWorldConfig
+        ));
+    }
+    mSlotDecoderBuffers.clear();
+    for (SizeType32 i = 0; i < mMaxNumSequences; ++i)
+    {
+        mSlotDecoderBuffers.emplace_back(std::make_shared<SlotDecoderBuffers>(
+            1 /*beam width*/, maxSequenceLen, getBufferManager()));
+    }
+    mDecodingInputs.resize(numMicroBatches);
 }
 
 TrtLocalTransformer::~TrtLocalTransformer()
@@ -88,12 +127,8 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
     RequestVector const& contextRequests,
     std::vector<SizeType32> const& numContextFramesVec,
     RequestVector const& generationRequests,
-    std::shared_ptr<runtime::GptDecoderBatched> &decoder,
-    std::unique_ptr<runtime::decoder_batch::Input> &decodingInput,
-    std::unique_ptr<runtime::decoder_batch::Output> &decodingOutput,
-    DecoderInputBuffers &decoderInputBuffers,
-    std::shared_ptr<DecoderBuffers> &decoderBuffers,
-    SizeType32 maxNumSequences
+    SizeType32 microBatchId,
+    SizeType32 fusedBufferId
 ) {
     // reshape input hidden states based on the inputs and fill it in using requests
     // check that all requests are actually cfg
@@ -151,6 +186,7 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
 
     // create a buffer for the tokens, 0th token reserved for hidden states
     inTokens = manager.gpu(ITensor::makeShape({numTokens + 1, batchSize / cfgMult}), nvinfer1::DataType::kINT32);
+    inTokensSliceHost = manager.cpu(ITensor::makeShape({batchSize / cfgMult}), nvinfer1::DataType::kINT32);
     // TODO: set intokens[0] to special token which is expanded to 0 with emb of local transformer
     // for CFG, model folds the tensor in two
     auto const logitsType = mRuntime->getEngine().getTensorDataType(kOutLogitsTensorName);
@@ -180,60 +216,72 @@ void TrtLocalTransformer::run(TensorPtr const& hiddenStates,
         sync_check_cuda_error(mRuntime->getStream().get());
 
         // handle logits, but forwarding them to requests
-        HandleLogits(contextRequests, generationRequests, decoderBuffers);
+        HandleLogits(contextRequests, generationRequests, mDecoderBuffers.at(i));
         // prepare inputs for decoder
-        std::tie(decodingInput, decodingOutput)
+        auto& decodingInput = mDecodingInputs.at(microBatchId);
+        std::tie(decodingInput, mDecodingOutput)
             = (*mMakeDecodingBatchInputOutput)(contextRequests, generationRequests,
-                *decoderBuffers, decoderInputBuffers, decoder->getDecoderState(),
-                mModelConfig, maxNumSequences, 1, getBufferManager(),
+                *mDecoderBuffers.at(i), mDecoderInputBuffers.at(fusedBufferId), mDecoder->getDecoderState(),
+                mModelConfig, mMaxNumSequences, 1, getBufferManager(),
                 mRuntime->getStream(), std::nullopt);
         // actually execute the decoder
-        runtime::CudaEvent finishedEvent = decoder->forwardAsync(*decodingOutput, *decodingInput);
+        runtime::CudaEvent finishedEvent = mDecoder->forwardAsync(*mDecodingOutput, *decodingInput);
         // update decoder buffers
         manager.getStream().wait(finishedEvent);
-        // not sure i actually need to copy all of these for all iterations
-        manager.copy(*decoder->getDecoderState().getAllNewTokens(), *decoderBuffers->newOutputTokensHost);
-        if (i == 0) {
-            manager.copy(*decoder->getDecoderState().getJointDecodingOutput().lengths, *decoderBuffers->sequenceLengthsHost);
-            auto const finishedSumDevice = decoder->getDecoderState().getFinishedSum();
-            manager.copy(*finishedSumDevice, *decoderBuffers->finishedSumHost);
-            auto const finishReasonsDevice = decoder->getDecoderState().getFinishReasons();
-            manager.copy(*finishReasonsDevice, *decoderBuffers->finishReasonsHost);
-        }
+        manager.copy(*mDecoder->getDecoderState().getAllNewTokens(), *mDecoderBuffers.at(i)->newOutputTokensHost);
+        manager.copy(*mDecoder->getDecoderState().getJointDecodingOutput().lengths, *mDecoderBuffers.at(i)->sequenceLengthsHost);
+        auto const finishedSumDevice = mDecoder->getDecoderState().getFinishedSum();
+        manager.copy(*finishedSumDevice, *mDecoderBuffers.at(i)->finishedSumHost);
+        auto const finishReasonsDevice = mDecoder->getDecoderState().getFinishReasons();
+        manager.copy(*finishReasonsDevice, *mDecoderBuffers.at(i)->finishReasonsHost);
+        sync_check_cuda_error(mRuntime->getStream().get());
 
+        // should copy newly generated tokens to inTokens.
+        // the problem is that `getAllNewTokens` and `newOutputTokensHost` are ordered using seqSlots.
+        // need to collect the tokens in order of the batch and copy them to inTokens
+        // TODO: is it possible to do it in a more optimized way??
+        // we have a buffer of size (1 x batchsize) on cpu, we collect to it the tokens,
+        // then copy it to inTokens
+        batchIndex = 0;
+        auto const hostNewOutputTokensShape = mDecoderBuffers.at(i)->newOutputTokensHost->getShape();
+        auto const* const hostNewOutputTokensData
+            = bufferCast<TokenIdType const>(*mDecoderBuffers.at(i)->newOutputTokensHost);
+        auto* const inTokensSliceHostData = bufferCast<TokenIdType>(*inTokensSliceHost);
         for (auto const& requests : {contextRequests, generationRequests})
         {
             for (auto const& llmReq : requests)
             {
                 auto const seqSlot = llmReq->mSeqSlots.at(0);
-                auto const hostNewOutputTokensShape = decoderBuffers->newOutputTokensHost->getShape();
-                auto const newTokenIdx = tensorrt_llm::common::flat_index(hostNewOutputTokensShape.d, 0, seqSlot, 0 /*beam*/);
-                auto const* const hostNewOutputTokensData
-                    = bufferCast<TokenIdType const>(*decoderBuffers->newOutputTokensHost);
+                auto const newTokenIdx = tensorrt_llm::common::flat_index(hostNewOutputTokensShape.d, 0 /*step*/, seqSlot, 0 /*beam*/);
                 auto const newToken = hostNewOutputTokensData[newTokenIdx];
-                TLLM_LOG_WARNING(">>>>>>sampled token %d for vocab %d", newToken, i);
-                llmReq->addNewToken(newToken, 0 /*beam*/);
+                inTokensSliceHostData[batchIndex] = newToken;
+                TLLM_LOG_WARNING(">>>>request ID %ld vocab %d, newToken %d", llmReq->mRequestId, i, newToken);
+                batchIndex++;
             }
         }
-        // copy logits to CPU and inspect
-        // TODO: THIS IS TEMP TEST OUTPUTs
-        /*
-        manager.copy(*outLogits, *outLogitsHost);
-        {
-            auto const reqNum = generationRequests.size() + contextRequests.size();
-            auto const* logitsHostPtr = bufferCast<half>(*outLogitsHost);
-            for (int b = 0; b < (int)reqNum; ++b)
-            {
-                int argmax = -1;
-                float maxVal = -1e9f;
-                for (int v = 0; v < vocabSize; ++v) {
-                    float fv = __half2float(logitsHostPtr[b * vocabSize + v]);
-                    if (fv > maxVal) { maxVal = fv; argmax = v; }
-                }
-            }
-        }
-        */
+        manager.copy(*inTokensSliceHost, *ITensor::slice(inTokens, i + 1, 1));
+        sync_check_cuda_error(mRuntime->getStream().get());
     }
+}
+
+std::shared_ptr<runtime::GptDecoderBatched>& TrtLocalTransformer::getDecoder()
+{
+    return mDecoder;
+}
+
+DecoderInputBuffers& TrtLocalTransformer::getDecoderInputBuffers(SizeType32 microBatchId)
+{
+    return mDecoderInputBuffers.at(microBatchId);
+}
+
+std::shared_ptr<DecoderBuffers>& TrtLocalTransformer::getDecoderBuffers(SizeType32 vocabId)
+{
+    return mDecoderBuffers.at(vocabId);
+}
+
+std::shared_ptr<SlotDecoderBuffers>& TrtLocalTransformer::getSlotDecoderBuffers(SizeType32 seqSlot)
+{
+    return mSlotDecoderBuffers.at(seqSlot);
 }
 
 runtime::BufferManager const& TrtLocalTransformer::getBufferManager() const
@@ -244,6 +292,11 @@ runtime::BufferManager const& TrtLocalTransformer::getBufferManager() const
 runtime::BufferManager::CudaStreamPtr TrtLocalTransformer::getRuntimeStreamPtr() const
 {
     return mRuntime->getStreamPtr();
+}
+
+runtime::CudaStream const& TrtLocalTransformer::getRuntimeStream() const
+{
+    return mRuntime->getStream();
 }
 
 } // namespace tensorrt_llm::batch_manager

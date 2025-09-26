@@ -38,6 +38,7 @@ namespace tensorrt_llm::batch_manager
 {
 class DecoderInputBuffers;
 class DecoderBuffers;
+class SlotDecoderBuffers;
 class MakeDecodingBatchInputOutput;
 
 class TrtLocalTransformer
@@ -54,7 +55,13 @@ public:
     TrtLocalTransformer(
         runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig,
-        runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger);
+        runtime::RawEngine const& rawEngine,
+        std::shared_ptr<nvinfer1::ILogger> logger,
+        SizeType32 maxNumSequences,
+        SizeType32 maxSequenceLen,
+        SizeType32 numMicroBatches,
+        SizeType32 maxBatchSize
+    );
     
     ~TrtLocalTransformer();
 
@@ -63,17 +70,18 @@ public:
         RequestVector const& contextRequests,
         std::vector<SizeType32> const& numContextFramesVec,
         RequestVector const& generationRequests,
-        // TODO: create those inside local transformer
-        std::shared_ptr<runtime::GptDecoderBatched> &decoder,
-        std::unique_ptr<runtime::decoder_batch::Input> &decodingInput,
-        std::unique_ptr<runtime::decoder_batch::Output> &decodingOutput,
-        DecoderInputBuffers &decoderInputBuffers,
-        std::shared_ptr<DecoderBuffers> &decoderBuffers,
-        SizeType32 maxNumSequences
+        SizeType32 microBatchId,
+        SizeType32 fusedBufferId
     );
+
+    [[nodiscard]] std::shared_ptr<runtime::GptDecoderBatched>& getDecoder();
+    [[nodiscard]] DecoderInputBuffers& getDecoderInputBuffers(SizeType32 microBatchId);
+    [[nodiscard]] std::shared_ptr<DecoderBuffers>& getDecoderBuffers(SizeType32 vocabId);
+    [[nodiscard]] std::shared_ptr<SlotDecoderBuffers>& getSlotDecoderBuffers(SizeType32 seqSlot);
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const;
     [[nodiscard]] runtime::BufferManager::CudaStreamPtr getRuntimeStreamPtr() const;
+    [[nodiscard]] runtime::CudaStream const& getRuntimeStream() const;
 
 private:
     runtime::ModelConfig mModelConfig;
@@ -86,11 +94,20 @@ private:
 
     TensorPtr inHiddenStates;  // [batch x dim]
     TensorPtr inTokens;  // [8 x batch']
+    TensorPtr inTokensSliceHost;  // [batch']
     TensorPtr outLogits;  // [batch' x VocabSize]
     TensorPtr outLogitsHost;  // [batch' x VocabSize]
     TensorMap inputMap;
     TensorMap outputMap;
 
+    // decoder (sampler) and buffers
+    SizeType32 mMaxNumSequences;
+    std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
+    std::vector<std::unique_ptr<runtime::decoder_batch::Input>> mDecodingInputs;
+    std::unique_ptr<runtime::decoder_batch::Output> mDecodingOutput;
+    std::vector<DecoderInputBuffers> mDecoderInputBuffers;
+    std::vector<std::shared_ptr<DecoderBuffers>> mDecoderBuffers;
+    std::vector<std::shared_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
 
     void HandleLogits(

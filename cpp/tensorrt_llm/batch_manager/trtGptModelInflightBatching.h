@@ -244,7 +244,6 @@ private:
         TensorMap const& inputMap, TensorMap const& outputMap);
 
     void createRuntimeContexts();
-    void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
     std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
@@ -280,7 +279,9 @@ private:
         RequestVector const& contextRequests, RequestVector const& generationRequests, SizeType32 bufferId);
 
     void setupDecoderStep(
-        RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers const& inputBuffers);
+        RequestVector const& contextRequests, RuntimeBuffers const& buffers,
+        std::shared_ptr<runtime::GptDecoderBatched> decoder,
+        DecoderInputBuffers const& inputBuffers);
     runtime::CudaEvent decoderStepAsync(ScheduledRequests const& scheduledRequests);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
@@ -302,7 +303,7 @@ private:
     /// @param[in] scheduledRequests The requests to copy the cache indirections for.
     /// @param[in] genBufferId The id of the generation buffers for those requests.
     void copyCacheIndirectionFromOutputsToInputs(
-        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId);
+        ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId);
 
     [[nodiscard]] bool getGatherGenerationLogits() const override
     {
@@ -438,7 +439,6 @@ private:
     // Runner for the TRT engine. The engine produces logits.
     std::shared_ptr<runtime::TllmRuntime> mRuntime;
     // Decoders that generates new tokens from the logits.
-    std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
     // optional local transformer to do auto-regressive multi-vocab sampling
@@ -510,17 +510,8 @@ private:
     /******************** Buffers ********************/
     // Buffers for each micro batch. Unfused path (mCtxGenFusion==false) uses two times the buffers.
     std::vector<std::shared_ptr<RuntimeBuffers>> mBuffers;
-    // Decoder buffers for each micro batch.
-    std::vector<DecoderInputBuffers> mDecoderInputBuffers;
-    // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::shared_ptr<DecoderBuffers> mDecoderBuffers;
-    // Buffers for each slot in the decoder
-    std::vector<std::shared_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
-    // Decoder input for each micro batch.
-    std::vector<std::unique_ptr<runtime::decoder_batch::Input>> mDecodingInputs;
-    std::unique_ptr<runtime::decoder_batch::Output> mDecodingOutput;
 
     /******************** Book keeping ********************/
     // List of requests in each micro batch

@@ -1084,7 +1084,7 @@ class T5TTSDecoderModel(PretrainedModel):
                     normalized_shape=self.config.hidden_size,
                     eps=self.config.norm_epsilon,
                     dtype=self.config.dtype, bias=False)
-
+            """
             self.lm_head = ColumnLinear(
                 self.config.hidden_size,
                 self.config.vocab_size,
@@ -1095,6 +1095,7 @@ class T5TTSDecoderModel(PretrainedModel):
                 tp_size=self.config.mapping.tp_size,
                 gather_output=True,
             )
+            """
 
         if self.config.relative_attention and not self.use_implicit_relative_attention:
             self.rel_attn_table = Parameter(
@@ -1229,8 +1230,9 @@ class T5TTSDecoderModel(PretrainedModel):
                 default_net().plugin_config.remove_input_padding)
 
             # [bs, hidden_size] -> [bs, vocab_size]
-            lm_logits = self.lm_head(hidden_states)
-            lm_logits.mark_output('logits', self._logits_dtype)
+            #lm_logits = self.lm_head(hidden_states)
+            #lm_logits.mark_output('logits', self._logits_dtype)
+            hidden_states.mark_output('logits', self._logits_dtype)
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
             hidden_states.mark_output('hidden_states_output', self._dtype)
@@ -1243,11 +1245,12 @@ class T5TTSDecoderModel(PretrainedModel):
                     present[1].mark_output(f'cross_present_key_value_{i}',
                                            self._kv_dtype)
             if self.mapping.is_last_pp_rank():
-                return (lm_logits, tuple(presents))
+                #return (lm_logits, tuple(presents))
+                return (hidden_states, tuple(presents))
             return (hidden_states, tuple(presents))
         else:
-            if self.mapping.is_last_pp_rank():
-                return lm_logits
+            #if self.mapping.is_last_pp_rank():
+            #    return lm_logits
             return hidden_states
 
     def prepare_inputs(self,

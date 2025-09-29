@@ -46,7 +46,7 @@ TrtLocalTransformer::TrtLocalTransformer(
     , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}
     , mRuntime{std::make_shared<TllmRuntime>(rawEngine, logger.get(), 1.0f)}
-    , hiddenSize{16192}  // TODO: change to 768 once switch to use hidden state instead of logits from model
+    , hiddenSize{768}  // TODO: change to 768 once switch to use hidden state instead of logits from model
     , numTokens{8}
     , vocabSize{2024}
     , mMaxNumSequences{maxNumSequences}

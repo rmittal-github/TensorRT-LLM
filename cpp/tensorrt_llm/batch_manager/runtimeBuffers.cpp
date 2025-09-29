@@ -76,6 +76,7 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     if (worldConfig.isLastPipelineParallelRank())
     {
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
+        auto const hiddenSize = modelConfig.getHiddenSize();
 
         if (modelConfig.computeContextLogits() && (numContextRequests > 0))
         {
@@ -84,7 +85,7 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
             auto const& engine = runtime.getEngine();
             auto const& manager = runtime.getBufferManager();
             auto const logitsType = engine.getTensorDataType(kLogitsTensorName);
-            logits = manager.gpu(ITensor::makeShape({numContextTokens + numGenSequences, vocabSizePadded}), logitsType);
+            logits = manager.gpu(ITensor::makeShape({numContextTokens + numGenSequences, hiddenSize}), logitsType);
         }
         else if (gatherGenerationLogits && modelConfig.getSpeculativeDecodingMode().isNone())
         {
@@ -98,7 +99,7 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
         }
         else
         {
-            logits->reshape(ITensor::makeShape({numLogits, vocabSizePadded}));
+            logits->reshape(ITensor::makeShape({numLogits, hiddenSize}));
         }
     }
 
@@ -306,12 +307,13 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         && worldConfig.isLastPipelineParallelRank())
     {
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
+        auto const hiddenSize = modelConfig.getHiddenSize();
         auto const logitsType = engine.getTensorDataType(batch_manager::RuntimeBuffers::kLogitsTensorName);
 
         generationLogitsCache.transposedLogits = manager.gpu(
-            ITensor::makeShape({maxBeamWidth, GenerationLogitsCache::kCACHE_LENGTH, vocabSizePadded}), logitsType);
+            ITensor::makeShape({maxBeamWidth, GenerationLogitsCache::kCACHE_LENGTH, hiddenSize}), logitsType);
         generationLogitsCache.logits = manager.gpu(
-            ITensor::makeShape({GenerationLogitsCache::kCACHE_LENGTH, maxBatchSize * maxBeamWidth, vocabSizePadded}),
+            ITensor::makeShape({GenerationLogitsCache::kCACHE_LENGTH, maxBatchSize * maxBeamWidth, hiddenSize}),
             logitsType);
 
         generationLogitsCache.fragmentPointerDevice

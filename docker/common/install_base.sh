@@ -26,6 +26,7 @@ init_ubuntu() {
     gdb \
     git-lfs \
     clang \
+    clangd \
     lld \
     llvm \
     libclang-rt-dev \

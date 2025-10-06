@@ -107,25 +107,46 @@ def load_model(checkpoint_file, hparams_file, audio_codec, engine_dir, legacy_co
 
 
 class IntLT(torch.nn.Module):
-    def __init__(self, model, dtype, d_model=768, cfg_scale=2.5):
+    def __init__(self, model:MagpieTTSModel, dtype, d_model=768, cfg_scale=2.5):
         super().__init__()
         self.local_transformer_in_projections=model.local_transformer_in_projection
         self.local_transformer=model.local_transformer
         self.local_transformer_out_projections=model.local_transformer_out_projections
+        
+        with torch.no_grad():
+            initial_embeddings = torch.nn.Embedding(model.audio_embeddings[0].weight.shape[0], model.audio_embeddings[0].weight.shape[1], _freeze=False).cuda().eval()
+            initial_embeddings.weight.data.zero_()
+            initial_embeddings = initial_embeddings.half()
+            initial_embeddings.weight.requires_grad = False
+            self.audio_embeddings = torch.nn.ModuleList([initial_embeddings])
+            
+            for audio_embedding in model.audio_embeddings:
+                audio_embedding.requires_grad = False
+                audio_embedding = audio_embedding.half()
+                self.audio_embeddings.append(audio_embedding)
+            
+            self.audio_embeddings = self.audio_embeddings.cuda().half()
+        
         self.dtype = dtype
         self.d_model = d_model
         self.cfg_scale = cfg_scale
     
-    def forward(self, dec_output, tokens_mask):
-        local_transformer_input = self.local_transformer_in_projections(dec_output)
+    def forward(self, dec_output, tokens):
         logits= []
-        local_transformer_output=self.local_transformer(local_transformer_input, tokens_mask)["output"]
-        for out_projection_layer in self.local_transformer_out_projections:
+        for layer_idx,out_projection_layer in enumerate(self.local_transformer_out_projections):
+            audio_embedding = self.audio_embeddings[layer_idx](tokens.transpose(0, 1))
+            audio_embedding = audio_embedding.repeat_interleave(2, dim=0)  # 2b x N x dimj
+            audio_embedding[:,0,:] += dec_output
+            
+            local_transformer_input = self.local_transformer_in_projections(audio_embedding)
+            
+            mask = torch.ones(audio_embedding.shape[0], audio_embedding.shape[1], device=audio_embedding.device, requires_grad=False, dtype=torch.bool)
+            local_transformer_output = self.local_transformer(local_transformer_input, mask)["output"]
+
             projection_layer_out = out_projection_layer(local_transformer_output[:, -1, :])
 
-            actual_codebook_size = dec_output.shape[0] // 2
-            cond_logits = projection_layer_out[:actual_codebook_size, :]  # select even indices (0,2,4,...)
-            uncond_logits = projection_layer_out[actual_codebook_size:, :]  # select odd indices (1,3,5,...)
+            cond_logits = projection_layer_out[::2, :]  # select even indices (0,2,4,...)
+            uncond_logits = projection_layer_out[1::2, :]  # select odd indices (1,3,5,...)
             final_logits = cond_logits * self.cfg_scale + uncond_logits * (1 - self.cfg_scale)
             logits.append(final_logits.unsqueeze(1))
 
@@ -133,28 +154,29 @@ class IntLT(torch.nn.Module):
 
     def export_to_onnx(self, onnx_file, opset_version):
         cfg_bs = 4
-        out_bs = cfg_bs / 2
+        out_bs = int(cfg_bs / 2)
         dtype = torch.float16 if self.dtype == "float16" else torch.float32
-        codebook_logits = torch.rand(cfg_bs, 1, self.d_model).to("cuda").to(dtype=dtype)
-        mask_logits = torch.ones(cfg_bs, 8).to("cuda").to(dtype=dtype)
+        dec_output = torch.rand(cfg_bs, self.d_model).to("cuda").to(dtype=dtype)
+        tokens = torch.ones(3, out_bs, dtype=torch.int).to("cuda")
 
         with torch.no_grad():
-            input_names = ["codebook_logits", "tokens_mask"]
+            input_names = ["hidden_states", "tokens"]
             output_names = ["logits"]
             dynamic_axes = {
-                "codebook_logits": {
+                "hidden_states": {
                     0: "cfg_batch_size",
                 },
-                "tokens_mask": {
-                    0: "cfg_batch_size",
+                "tokens": {
+                    0: "num_tokens",
+                    1: "batch_size"
                 },
                 "logits": {
                     0: "batch_size",
                 }
             }
             inputs_args = {
-                'codebook_logits': codebook_logits,
-                'tokens_mask': mask_logits,
+                'hidden_states': dec_output,
+                'tokens': tokens,
             }
             torch.onnx.export(self,
                               tuple(inputs_args.values()),
@@ -191,6 +213,8 @@ class MagpieLocalTransformerExportTRT:
         self.minBS = minBS
         self.optBS = optBS
         self.maxBS = maxBS
+        if optBS is None:
+            self.optBS = minBS + int((maxBS - minBS) / 2)
 
         print(model_cfg.keys())
         self.n_codebooks = model_cfg.get("num_codebooks", 8)
@@ -238,25 +262,26 @@ class MagpieLocalTransformerExportTRT:
             print("Succeeded parsing %s" % onnx_file)
 
         nBS = -1
+        nTokens = -1
         nMinBS = self.minBS
         nMaxBS = self.maxBS
         nOptBS = self.optBS
         
         input_feat = network.get_input(0)
-        input_mask = network.get_input(1)
-        input_feat.shape = [nBS, 1, self.d_model]
-        input_mask.shape = [nBS, self.n_codebooks]
+        input_tokens = network.get_input(1)
+        input_feat.shape = [nBS, self.d_model]
+        input_tokens.shape = [nTokens, nBS]
         profile.set_shape(
             input_feat.name,
-            [nMinBS, 1, self.d_model],
-            [nOptBS, 1, self.d_model],
-            [nMaxBS, 1, self.d_model],
+            [nMinBS*2, self.d_model],
+            [nOptBS*2, self.d_model],
+            [nMaxBS*2, self.d_model],
         )
         profile.set_shape(
-            input_mask.name,
-            [nMinBS, self.n_codebooks],
-            [nOptBS, self.n_codebooks],
-            [nMaxBS, self.n_codebooks],
+            input_tokens.name,
+            [1, nMinBS],
+            [4, nOptBS],
+            [8, nMaxBS],
         )
 
         config.add_optimization_profile(profile)
@@ -285,7 +310,7 @@ class MagpieLocalTransformerExportTRT:
 @click.option("--model_ckpt", type=str, help="Path to model checkpoint")
 @click.option("--audio_codec", type=str, help="Output Path to audio codec")
 @click.option("--hparams_file", type=str, help="Path to hparams file")
-@click.option("--max_bs", type=int, default=64, help="maximum batch size")
+@click.option("--max_bs", type=int, default=32, help="maximum batch size")
 @click.option("--min_bs", type=int, default=1, help="minimum batch size")
 @click.option("--opt_bs", type=int, default=None, help="optimal batch size")
 @click.option("--opset_version", type=int, default=17, help="onnx opset version")

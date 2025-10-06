@@ -148,7 +148,7 @@ inline std::optional<bool> isCudaLaunchBlocking()
 {
     thread_local bool firstCall = true;
     thread_local std::optional<bool> result = std::nullopt;
-    if (!firstCall)
+    if (firstCall)
     {
         char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
         if (env != nullptr && std::string(env) == "1")
@@ -159,8 +159,8 @@ inline std::optional<bool> isCudaLaunchBlocking()
         {
             result = false;
         }
-        firstCall = false;
     }
+    firstCall = false;
     return result;
 }
 

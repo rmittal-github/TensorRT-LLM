@@ -223,8 +223,73 @@ int32_t CategoricalSamplingPlugin::enqueue(PluginTensorDesc const* inputDesc, Pl
         half const* probs = static_cast<half const*>(inputs[0]);
         int32_t* output = static_cast<int32_t*>(outputs[0]);
 
+#ifndef NDEBUG
+        // Debug code - only compiled in debug builds
+        std::cout << "=== Input Tensor Debug ===" << std::endl;
+        std::cout << "Input tensor has " << inputDesc[0].dims.nbDims << " dimensions: [";
+        for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
+        {
+            std::cout << inputDesc[0].dims.d[i];
+            if (i < inputDesc[0].dims.nbDims - 1)
+                std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+        std::cout << "Interpreting as: batchSize=" << batchSize << ", vocabSize=" << vocabSize << std::endl;
+
+        // Debug: Print probability statistics for first batch element
+        std::vector<half> firstBatchProbs(vocabSize);
+        cudaMemcpy(firstBatchProbs.data(), probs, vocabSize * sizeof(half), cudaMemcpyDeviceToHost);
+
+        std::cout << "First batch - first 20 values: ";
+        for (int i = 0; i < std::min(20, vocabSize); ++i)
+        {
+            std::cout << __half2float(firstBatchProbs[i]) << " ";
+        }
+        std::cout << std::endl;
+
+        // Find max value and its index
+        float maxVal = -1e10f;
+        int maxIdx = -1;
+        float sum = 0.0f;
+        for (int i = 0; i < vocabSize; ++i)
+        {
+            float val = __half2float(firstBatchProbs[i]);
+            sum += val;
+            if (val > maxVal)
+            {
+                maxVal = val;
+                maxIdx = i;
+            }
+        }
+        std::cout << "First batch stats: max_value=" << maxVal << " at index=" << maxIdx << ", sum=" << sum
+                  << ", mean=" << (sum / vocabSize) << std::endl;
+#endif
+
         // Call kernel with clock-based seeding (FP16 version)
         categoricalSampling(probs, output, batchSize, vocabSize);
+
+        // Check for kernel errors
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::cerr << "CUDA kernel launch error: " << cudaGetErrorString(err) << std::endl;
+            return -1;
+        }
+
+#ifndef NDEBUG
+        // Debug: Copy output to host and print (only in debug builds)
+        cudaDeviceSynchronize();
+        std::vector<int32_t> hostOutput(batchSize);
+        cudaMemcpy(hostOutput.data(), output, batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        std::cout << "Output batchSize: " << batchSize << std::endl;
+        std::cout << "Sampled output: ";
+        for (int i = 0; i < batchSize; i++)
+        {
+            std::cout << "i: " << i << ", output: " << hostOutput[i] << "\t";
+        }
+        std::cout << std::endl;
+        std::cout << "========================" << std::endl;
+#endif
 
         return 0;
     }

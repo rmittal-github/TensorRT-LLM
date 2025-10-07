@@ -25,11 +25,42 @@ __global__ void categoricalSamplingKernel(half const* probs, int* output, int ba
     float random_val = curand_uniform(&localState);
 
     // Compute sum of probabilities for normalization (convert to float for accuracy)
+    // Also check for negative values which indicate logits were passed instead of probabilities
     half const* prob_row = probs + batch_idx * vocab_size;
     float sum = 0.0f;
+    bool has_negative = false;
+    float min_val = 1e6f;
+
     for (int i = 0; i < vocab_size; ++i)
     {
-        sum += __half2float(prob_row[i]);
+        float val = __half2float(prob_row[i]);
+        if (val < 0.0f)
+        {
+            has_negative = true;
+        }
+        if (val < min_val)
+        {
+            min_val = val;
+        }
+        sum += val;
+    }
+
+    // Error out if negative probabilities detected
+    if (has_negative)
+    {
+        printf("ERROR in categoricalSampling: Negative probability detected! min_value=%f, sum=%f\n", min_val, sum);
+        printf("This kernel expects PROBABILITIES (positive values), not LOGITS.\n");
+        printf("Please apply softmax to your logits before passing to this plugin.\n");
+        output[batch_idx] = -1; // Return error indicator
+        return;
+    }
+
+    // Check for invalid sum
+    if (sum <= 0.0f)
+    {
+        printf("ERROR in categoricalSampling: Invalid probability sum=%f for batch_idx=%d\n", sum, batch_idx);
+        output[batch_idx] = -1;
+        return;
     }
 
     // Perform inverse transform sampling with normalization

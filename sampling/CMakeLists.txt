@@ -34,14 +34,21 @@ target_compile_options(
   PRIVATE $<$<COMPILE_LANGUAGE:CUDA>: --expt-relaxed-constexpr --use_fast_math
           -Xcompiler=-Wall >)
 
-# Test executable
+# Test executables
 add_executable(test_categorical_sampling test/test_categorical_sampling.cu)
 target_link_libraries(test_categorical_sampling categorical_sampling
+                      ${CUDA_LIBRARIES} curand)
+
+add_executable(test_categorical_sampling_fp16
+               test/test_categorical_sampling_fp16.cu)
+target_link_libraries(test_categorical_sampling_fp16 categorical_sampling
                       ${CUDA_LIBRARIES} curand)
 
 # Enable testing
 enable_testing()
 add_test(NAME CategoricalSamplingTest COMMAND test_categorical_sampling)
+add_test(NAME CategoricalSamplingFP16Test
+         COMMAND test_categorical_sampling_fp16)
 
 # Print configuration
 message(STATUS "CUDA Architectures: ${CMAKE_CUDA_ARCHITECTURES}")

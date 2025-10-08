@@ -36,8 +36,9 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Plugin library
 add_library(
-  categorical_sampling_plugin SHARED CategoricalSamplingPlugin.cpp
-                                     ../sampling/src/categorical_sampling.cu)
+  categorical_sampling_plugin SHARED
+  CategoricalSamplingPlugin.cpp
+  ../categorical_sampling_cuda_kernel/src/categorical_sampling.cu)
 
 target_link_libraries(categorical_sampling_plugin ${TENSORRT_LIBRARY_INFER}
                       ${CUDA_LIBRARIES} curand)
@@ -46,20 +47,13 @@ set_target_properties(
   categorical_sampling_plugin PROPERTIES CUDA_SEPARABLE_COMPILATION ON
                                          POSITION_INDEPENDENT_CODE ON)
 
-# Optional: Build example
-option(BUILD_EXAMPLE "Build example application" ON)
-if(BUILD_EXAMPLE)
-  add_executable(categorical_sampling_example example.cpp)
-  target_link_libraries(
-    categorical_sampling_example categorical_sampling_plugin
-    ${TENSORRT_LIBRARY_INFER} ${TENSORRT_LIBRARY_INFER_PLUGIN}
-    ${CUDA_LIBRARIES})
-endif()
+# # Install install( TARGETS categorical_sampling_plugin LIBRARY DESTINATION lib
+# ARCHIVE DESTINATION lib)
 
-# Install
+# Install to custom build directory
 install(
   TARGETS categorical_sampling_plugin
-  LIBRARY DESTINATION lib
-  ARCHIVE DESTINATION lib)
+  LIBRARY DESTINATION /code/tensorrt_llm/build
+  ARCHIVE DESTINATION /code/tensorrt_llm/build)
 
-install(FILES CategoricalSamplingPlugin.h DESTINATION include)
+install(FILES CategoricalSamplingPlugin.h DESTINATION /code/tensorrt_llm/build)

@@ -16,7 +16,7 @@
  */
 
 #include "CategoricalSamplingPlugin.h"
-#include "include/categorical_sampling.cuh"
+#include "categorical_sampling.cuh"
 #include <cassert>
 #include <cstring>
 #include <cuda_fp16.h>

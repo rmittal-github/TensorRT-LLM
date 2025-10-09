@@ -14,7 +14,7 @@ There are few pieces to discuss:
 
 * `linear_lt_autoregressive.ipynb`: Demonstrates of how start from PyTorch code that uses the `CategoricalSampling` operation and trace it to ONNX and then TensorRT. It has an example of an autoregressive loop running a dummy LT (embedding layer + linear) and sampling at each step, all traced into a single graph via PyTorch -> ONNX -> TensorRT.
 
-## File structure
+## Directory structure
 ```
 tensorrt_llm/  (top-level)
 ├── linear_lt_autoregressive.ipynb      # demo notebook showing how to trace a model with the custom sampling operation

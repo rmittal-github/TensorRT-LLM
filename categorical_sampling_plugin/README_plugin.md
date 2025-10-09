@@ -3,7 +3,7 @@
 ## Overview
 Since TensorRT does not support categorical sampling, we add that as a **TensorRT Plugin**.
 
-To include the operation in a trace model, the user can refer to the plugin by name in the PyTorch code being traced. During tracing that operation becomes part of the ONNX graph. When TensorRT converts the ONNX graph to TensorRT it encounters this operation and looks for the corresponding name among its plugin. If we have provided the plugin to TensorRT it can find it and incorporate it in the engine it builds.
+To include the sampling operation in a PyTorch model that we will be tracing to onnx and TensorRT, we can refer to the plugin by name in the PyTorch code being traced (example below). During tracing, the operation becomes part of the ONNX graph (just a symbolic name, no implementation needed at this point). When `trtexec` loads the ONNX graph and encounters the sampling operation it looks for the corresponding name among its plugins. If we have provided the plugin path to TensorRT, it finds the plugin, loads it and executes it when running the model.
 
 There are few pieces to discuss:
 
@@ -90,4 +90,4 @@ Use `torch.export`. See `linear_lt_autoregressive.ipynb` for an example.
 The last line points TensorRT to our plugin.
 
 # Notes
-The plugin is built as a shared library (`*.so`). It appears that `trtexec` loads the library dynamically during execution but does **not** incorporate it into the engine itself. We will need to figure out how this loading works when executing from the TRT-LLM runtime or alternatively try to statically link it into the `TRT-LLM` runtime.
+The plugin is built as a shared library (`*.so`). It appears that `trtexec` loads the library dynamically during execution but does **not** serialize it into the engine itself. We will need to figure out how this loading works when executing from the TRT-LLM runtime. Options are: (1) load dynamically in TRT-LLM runtime, (2) statically link it into the TRT-LLM runtime, (3) serialize it into the engine itself (`trtexec` has an option `--setPluginsToSerialize` which seems related).

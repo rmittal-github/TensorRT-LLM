@@ -42,12 +42,12 @@ tensorrt_llm/  (top-level)
 cd categorical_sampling_plugin
 ./build_plugin.sh
 ```
-This will build both the plugin (including the CUDA kernel) and copy the resulting shared library to:
+This will build the plugin (including the CUDA kernel) and copy the resulting shared library to:
 `tensorrt_llm/build/libcategorical_sampling_plugin.so`.
 
-Note that there is also a second script (`build_kernel_test.sh`) that builds a standalone unit test for the CUDA kernel. But you don't need that to use the plugin.
+Note that there is also a second script (`build_kernel_test.sh`) that builds a standalone unit test for the CUDA kernel (not needed to use the plugin).
 
-### 2. Define Categorical Sampling as a custom operation in your PyTorch code
+### 2. Define Categorical Sampling as a Custom Operation in your PyTorch code
 
 ```python
 import torch
@@ -56,9 +56,8 @@ from torch import Tensor
 class CategoricalSamplingFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor):
-        # Forward is only used in eager runs (not during ONNX parsing).
-        # So you can put a dummy implementation here.
-        # We return a 1D INT32 tensor to match plugin output type
+        # Forward is not used during ONNX parsing. So you can put a dummy implementation here.
+        # We return a 1D INT32 tensor to match plugin output type.
         return torch.zeros(x.shape[0], dtype=torch.int32, device=x.device)
 
     @staticmethod
@@ -69,7 +68,7 @@ class CategoricalSamplingFn(torch.autograd.Function):
         output.setType(x.type().with_dtype(torch.int32).with_sizes([None]))
         return output
 
-# IMPORTANT: This function is what you call in your model. See `linear_lt_autoregressive.ipynb` for an example.
+# IMPORTANT: The following function is what you call in your model. See `linear_lt_autoregressive.ipynb` for an example.
 def categorical_sampling(x: Tensor) -> Tensor:
     return CategoricalSamplingFn.apply(x)
 ```
@@ -87,7 +86,7 @@ Use `torch.export`. See `linear_lt_autoregressive.ipynb` for an example.
     --maxShapes=hidden_states:32x768 \
     --plugins=/code/tensorrt_llm/build/libcategorical_sampling_plugin.so
 ```
-The last line points TensorRT to our plugin.
+The last line tells TensorRT where to find our plugin.
 
 # Notes
-The plugin is built as a shared library (`*.so`). It appears that `trtexec` loads the library dynamically during execution but does **not** serialize it into the engine itself. We will need to figure out how this loading works when executing from the TRT-LLM runtime. Options are: (1) load dynamically in TRT-LLM runtime, (2) statically link it into the TRT-LLM runtime, (3) serialize it into the engine itself (`trtexec` has an option `--setPluginsToSerialize` which seems related).
+The plugin is currently built as a shared library (`*.so`). `trtexec` seems to load library dynamically during execution but does **not** serialize it into the engine itself. We will need to figure out how this loading will work in the context of the TRT-LLM runtime. Options are: (1) load dynamically in TRT-LLM runtime, (2) statically link it into the TRT-LLM runtime, (3) serialize it into the engine itself (`trtexec` has an option `--setPluginsToSerialize` which seems related).

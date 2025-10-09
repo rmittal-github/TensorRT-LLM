@@ -27,12 +27,12 @@ tensorrt_llm/  (top-level)
     ├── CategoricalSamplingPlugin.h     # Plugin header
     └── cuda_kernel/                    # Kernel subdirectory
         ├── CMakeLists.txt              # Kernel unit test build
-        ├── include/                     # Kernel header
-        │   └── categorical_sampling.cuh
-        ├── src/                         # Kernel implementation
-        │   └── categorical_sampling.cu
-        └── test/                        # Kernel unit test
-            └── test_categorical_sampling_fp16.cu
+        ├── include/
+        │   └── categorical_sampling.cuh          # Kernel header
+        ├── src/
+        │   └── categorical_sampling.cu           # Kernel implementation
+        └── test/
+            └── test_categorical_sampling_fp16.cu # Kernel unit test
 ```
 ## How to build and use the plugin
 
@@ -45,9 +45,9 @@ cd categorical_sampling_plugin
 This will build the plugin (including the CUDA kernel) and copy the resulting shared library to:
 `tensorrt_llm/build/libcategorical_sampling_plugin.so`.
 
-Note that there is also a second script (`build_kernel_test.sh`) that builds a standalone unit test for the CUDA kernel (not needed to use the plugin).
+Note that there is also a second script (`build_kernel_test.sh`) that builds a standalone unit test for the CUDA kernel (you don't need this just to use the plugin).
 
-### 2. Define Categorical Sampling as a Custom Operation in your PyTorch code
+### 2. Define Categorical Sampling as a custom operation in your PyTorch code
 
 ```python
 import torch

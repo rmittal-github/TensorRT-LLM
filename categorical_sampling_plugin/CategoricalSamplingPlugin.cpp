@@ -266,7 +266,7 @@ int32_t CategoricalSamplingPlugin::enqueue(PluginTensorDesc const* inputDesc, Pl
 #endif
 
         // Call kernel with clock-based seeding (FP16 version)
-        categoricalSampling(probs, output, batchSize, vocabSize);
+        categoricalSampling(probs, output, batchSize, vocabSize, stream);
 
         // Check for kernel errors
         cudaError_t err = cudaGetLastError();

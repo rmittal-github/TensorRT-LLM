@@ -15,8 +15,9 @@
  * @param output Sampled indices [batch_size]
  * @param batch_size Number of probability distributions to sample from
  * @param vocab_size Size of each probability distribution
+ * @param stream CUDA stream to launch the kernel on
  *
  * @note This function uses clock64() for seeding, providing non-reproducible randomness.
  *       Each call will produce different results even with the same input.
  */
-void categoricalSampling(half const* probs, int* output, int batch_size, int vocab_size);
+void categoricalSampling(half const* probs, int* output, int batch_size, int vocab_size, cudaStream_t stream);

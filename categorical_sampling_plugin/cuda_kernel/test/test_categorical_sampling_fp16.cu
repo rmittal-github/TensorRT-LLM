@@ -60,7 +60,7 @@ void testBasicSampling()
 
     // Run sampling (uses clock-based seeding)
     std::vector<int> h_output(batch_size);
-    categoricalSampling(d_probs, d_output, batch_size, vocab_size);
+    categoricalSampling(d_probs, d_output, batch_size, vocab_size, 0);
 
     // Copy results back
     CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, batch_size * sizeof(int), cudaMemcpyDeviceToHost));
@@ -105,7 +105,7 @@ void testStatisticalDistribution()
     // Sample many times (each call uses clock-based seeding)
     for (int i = 0; i < num_samples; ++i)
     {
-        categoricalSampling(d_probs, d_output, 1, vocab_size);
+        categoricalSampling(d_probs, d_output, 1, vocab_size, 0);
 
         int result;
         CUDA_CHECK(cudaMemcpy(&result, d_output, sizeof(int), cudaMemcpyDeviceToHost));
@@ -170,7 +170,7 @@ void testUnnormalizedProbabilities()
     std::vector<int> counts(vocab_size, 0);
     for (int i = 0; i < num_samples; ++i)
     {
-        categoricalSampling(d_probs, d_output, 1, vocab_size);
+        categoricalSampling(d_probs, d_output, 1, vocab_size, 0);
         int result;
         CUDA_CHECK(cudaMemcpy(&result, d_output, sizeof(int), cudaMemcpyDeviceToHost));
         counts[result]++;
@@ -241,7 +241,7 @@ void testZeroProbabilities()
     std::vector<int> counts(vocab_size, 0);
     for (int i = 0; i < num_samples; ++i)
     {
-        categoricalSampling(d_probs, d_output, 1, vocab_size);
+        categoricalSampling(d_probs, d_output, 1, vocab_size, 0);
         int result;
         CUDA_CHECK(cudaMemcpy(&result, d_output, sizeof(int), cudaMemcpyDeviceToHost));
         counts[result]++;
@@ -305,7 +305,7 @@ void testSingleElement()
 
     for (int test = 0; test < num_tests; ++test)
     {
-        categoricalSampling(d_probs, d_output, batch_size, vocab_size);
+        categoricalSampling(d_probs, d_output, batch_size, vocab_size, 0);
         CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, batch_size * sizeof(int), cudaMemcpyDeviceToHost));
 
         for (int i = 0; i < batch_size; ++i)
@@ -355,10 +355,10 @@ void testNonReproducibility()
     CUDA_CHECK(cudaMemcpy(d_probs, h_probs.data(), batch_size * vocab_size * sizeof(half), cudaMemcpyHostToDevice));
 
     // Sample twice
-    categoricalSampling(d_probs, d_output1, batch_size, vocab_size);
+    categoricalSampling(d_probs, d_output1, batch_size, vocab_size, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    categoricalSampling(d_probs, d_output2, batch_size, vocab_size);
+    categoricalSampling(d_probs, d_output2, batch_size, vocab_size, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<int> h_output1(batch_size);

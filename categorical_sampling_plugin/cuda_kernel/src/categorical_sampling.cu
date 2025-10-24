@@ -82,10 +82,10 @@ __global__ void categoricalSamplingKernel(half const* probs, int* output, int ba
 }
 
 // Host function implementation
-void categoricalSampling(half const* probs, int* output, int batch_size, int vocab_size)
+void categoricalSampling(half const* probs, int* output, int batch_size, int vocab_size, cudaStream_t stream)
 {
     int const threads_per_block = 256;
     int const num_blocks = (batch_size + threads_per_block - 1) / threads_per_block;
 
-    categoricalSamplingKernel<<<num_blocks, threads_per_block>>>(probs, output, batch_size, vocab_size);
+    categoricalSamplingKernel<<<num_blocks, threads_per_block, 0, stream>>>(probs, output, batch_size, vocab_size);
 }

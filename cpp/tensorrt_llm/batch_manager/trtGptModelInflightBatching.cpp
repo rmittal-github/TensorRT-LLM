@@ -2107,7 +2107,6 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     for (SizeType32 vid = 0; vid < getNumVocabs(); vid++)
     {
         auto& decoderInputBuffers = mDecoderInputBuffers.at(getFusedBufferId());
-        auto& decoderOutputBuffers = mDecoderOutputBuffers[vid].at(getFusedBufferId());
         auto& decoderState = mDecoderStates[vid];
 
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
@@ -2433,7 +2432,8 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
 
         // Terminate if request has finished or if it is speculative decoding target model
         if (decoderFinishedSumPtr[seqSlot] == reqBeamWidth
-            || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens()))
+            || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens())
+            || (mModelConfig.useAttentionPrior() && llmReq->isAttentionPriorFinished()))
         {
             postProcessRequest(*llmReq, numDroppedTokens);
 

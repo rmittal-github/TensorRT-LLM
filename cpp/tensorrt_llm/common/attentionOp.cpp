@@ -2288,7 +2288,15 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         // self attn
         XQAParams xqaParams{};
         this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/false);
-        if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
+        // T5TTS/Magpie cross-attention with the attention prior must run in the MMHA kernel, which
+        // applies the prior mask and writes the attention_prior_scores the host focus tracker reads.
+        // The XQA path (TllmGen decode kernels on SM100 family) does neither, so the scores stay
+        // all-zero, the focus advances blindly and EOS/termination never triggers (long static tail,
+        // repeated phrases). mEnableXQA is also restored from the serialized engine, so it cannot be
+        // switched off from the constructor.
+        bool const xqaBypassForAttentionPrior
+            = isCrossAttention() && (ComputeAttentionPrior() || ApplyAttentionPrior());
+        if (mEnableXQA && !xqaBypassForAttentionPrior && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
             xqaParams.stream = stream;
